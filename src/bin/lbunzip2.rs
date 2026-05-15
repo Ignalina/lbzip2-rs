@@ -95,9 +95,30 @@ fn main() {
             let out_file = File::create(&output_path).expect("create output");
             let mut w = BufWriter::with_capacity(BUF_CAP, out_file);
             let mut total = 0u64;
+            #[cfg(feature = "timing")]
+            let mut batch_bytes = 0u64;
+            #[cfg(feature = "timing")]
+            let mut batch_start = Instant::now();
             for chunk in write_rx {
-                total += chunk.len() as u64;
+                let len = chunk.len() as u64;
+                total += len;
                 w.write_all(&chunk).expect("write output");
+                #[cfg(feature = "timing")]
+                {
+                    batch_bytes += len;
+                    // report every ~500 MB written
+                    if batch_bytes >= 500 * 1024 * 1024 {
+                        let dt = batch_start.elapsed().as_secs_f64();
+                        eprintln!(
+                            "[timing] writer: {:.0} MB in {:.2}s = {:.0} MB/s",
+                            batch_bytes as f64 / (1024.0 * 1024.0),
+                            dt,
+                            batch_bytes as f64 / (1024.0 * 1024.0) / dt,
+                        );
+                        batch_bytes = 0;
+                        batch_start = Instant::now();
+                    }
+                }
             }
             w.flush().expect("flush output");
             total
@@ -121,12 +142,36 @@ fn main() {
     // Reads raw data into slot[CARRY_HEADROOM..], sends (slot, read_len, is_last).
     let (filled_tx, filled_rx) = mpsc::sync_channel::<(Vec<u8>, usize, bool)>(RING_SLOTS);
     let reader_handle = std::thread::spawn(move || {
+        #[cfg(feature = "timing")]
+        let mut chunk_n = 0u32;
         loop {
+            #[cfg(feature = "timing")]
+            let t_wait = Instant::now();
+
             let mut slot = match slot_return_rx.recv() {
                 Ok(s) => s,
                 Err(_) => break,
             };
+
+            #[cfg(feature = "timing")]
+            let wait_ms = t_wait.elapsed().as_secs_f64() * 1000.0;
+            #[cfg(feature = "timing")]
+            let t_read = Instant::now();
+
             let got = read_chunk(&mut reader, &mut slot[CARRY_HEADROOM..]);
+
+            #[cfg(feature = "timing")]
+            {
+                let read_ms = t_read.elapsed().as_secs_f64() * 1000.0;
+                let read_mb = got as f64 / (1024.0 * 1024.0);
+                let mbps = if read_ms > 0.0 { read_mb / (read_ms / 1000.0) } else { 0.0 };
+                eprintln!(
+                    "[timing] reader chunk {}: wait={:.0}ms  read={:.0}ms ({:.0} MB, {:.0} MB/s)",
+                    chunk_n, wait_ms, read_ms, read_mb, mbps,
+                );
+                chunk_n += 1;
+            }
+
             let is_last = got < CHUNK_SIZE;
             if filled_tx.send((slot, got, is_last)).is_err() {
                 break;
@@ -142,12 +187,21 @@ fn main() {
     // (< 1 MB). Copied into the headroom area of the next slot so
     // decode_chunk sees one contiguous &[u8] without copying the 200 MB.
     let mut carry: Vec<u8> = header.to_vec();
+    #[cfg(feature = "timing")]
+    let mut chunk_n = 0u32;
+    #[cfg(feature = "timing")]
+    let mut t_recv_start = Instant::now();
 
     for (mut slot, read_len, is_last) in filled_rx {
+        #[cfg(feature = "timing")]
+        let recv_wait_ms = t_recv_start.elapsed().as_secs_f64() * 1000.0;
         if read_len == 0 && carry.len() <= 4 {
             slot_return_tx.send(slot).ok();
             break;
         }
+
+        #[cfg(feature = "timing")]
+        let t_carry = Instant::now();
 
         // Copy tiny carry into headroom just before the read data.
         let carry_len = carry.len();
@@ -158,10 +212,18 @@ fn main() {
 
         let data = &slot[data_start..data_end];
 
+        #[cfg(feature = "timing")]
+        let carry_ms = t_carry.elapsed().as_secs_f64() * 1000.0;
+        #[cfg(feature = "timing")]
+        let t_decode = Instant::now();
+
         // Parallel decode → segments returned separately (no big memcpy).
         let (segments, consumed) = decoder
             .decode_chunk_segments(data, is_last)
             .expect("bz2 decode error");
+
+        #[cfg(feature = "timing")]
+        let decode_ms = t_decode.elapsed().as_secs_f64() * 1000.0;
 
         // Save new carry (tiny — just the unconsumed tail).
         carry.clear();
@@ -170,12 +232,33 @@ fn main() {
         // Recycle slot back to reader — no allocation.
         slot_return_tx.send(slot).ok();
 
+        #[cfg(feature = "timing")]
+        let t_send = Instant::now();
+
+        let mut seg_bytes = 0usize;
         // Send each segment to writer individually — no single-thread
         // assembly of a giant Vec.  Writer writes them in order.
         for seg in segments {
             if !seg.is_empty() {
+                seg_bytes += seg.len();
                 write_tx.send(seg).expect("send to writer");
             }
+        }
+
+        #[cfg(feature = "timing")]
+        {
+            let send_ms = t_send.elapsed().as_secs_f64() * 1000.0;
+            let in_mb = (read_len + carry_len) as f64 / (1024.0 * 1024.0);
+            let out_mb = seg_bytes as f64 / (1024.0 * 1024.0);
+            let decode_mbps = if decode_ms > 0.0 { out_mb / (decode_ms / 1000.0) } else { 0.0 };
+            eprintln!(
+                "[timing] decode chunk {}: recv_wait={:.0}ms  carry={:.1}ms ({:.1}MB)  decode={:.0}ms ({:.0}MB in, {:.0}MB out, {:.0} MB/s)  send={:.1}ms",
+                chunk_n, recv_wait_ms, carry_ms, carry_len as f64 / (1024.0 * 1024.0),
+                decode_ms, in_mb, out_mb, decode_mbps,
+                send_ms,
+            );
+            chunk_n += 1;
+            t_recv_start = Instant::now();
         }
 
         if is_last {

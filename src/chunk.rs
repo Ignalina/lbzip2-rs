@@ -64,11 +64,26 @@ impl ChunkDecoder {
         };
 
         let n_threads = rayon::current_num_threads();
+        // Oversplit: more segments than cores lets rayon work-steal for balance.
+        let n_splits = n_threads * 4;
         let max_bs = self.max_blocksize;
         let total_bits = data.len() as u64 * 8;
 
         // ── Parallel: find quick-verified split boundaries ────────────
-        let splits = block_scan::split_boundaries_parallel(data, n_threads, max_bs);
+        #[cfg(feature = "timing")]
+        let t0 = std::time::Instant::now();
+
+        let splits = block_scan::split_boundaries_parallel(data, n_splits, max_bs);
+
+        #[cfg(feature = "timing")]
+        eprintln!(
+            "[timing] split_boundaries_parallel: {} splits in {:.3}ms  (chunk {:.1} MB, {} threads, {}x oversplit)",
+            splits.len(),
+            t0.elapsed().as_secs_f64() * 1000.0,
+            data.len() as f64 / (1024.0 * 1024.0),
+            n_threads,
+            n_splits / n_threads,
+        );
 
         let mut segment_starts = Vec::with_capacity(n_threads);
         segment_starts.push(first_block);
@@ -99,17 +114,26 @@ impl ChunkDecoder {
         };
 
         // ── Parallel decode — one thread per segment ────────────────────
-        let results: Vec<Vec<u8>> = (0..decode_segments)
+        let results: Vec<(Vec<u8>, u64, u64, f64)> = (0..decode_segments)
             .into_par_iter()
             .map(|i| {
-                let end_bit = segment_end(i);
-                let mut output = Vec::new();
+                #[cfg(feature = "timing")]
+                let t_seg = std::time::Instant::now();
 
                 let start_bit = segment_starts[i].bit_offset + 48;
+                let end_bit = segment_end(i);
+                let comp_bits = end_bit.saturating_sub(segment_starts[i].bit_offset);
+                let mut output = Vec::new();
+
                 let mut reader = BitReader::from_bit_offset(data, start_bit as usize);
                 let blk = match block::decode_block(&mut reader, max_bs) {
                     Ok(b) => b,
-                    Err(_) => return output,
+                    Err(_) => {
+                        let _ms = 0.0f64;
+                        #[cfg(feature = "timing")]
+                        let _ms = t_seg.elapsed().as_secs_f64() * 1000.0;
+                        return (output, comp_bits, 0, _ms);
+                    }
                 };
                 output.extend_from_slice(&blk);
 
@@ -146,9 +170,39 @@ impl ChunkDecoder {
                     }
                 }
 
-                output
+                let out_len = output.len() as u64;
+                let _ms = 0.0f64;
+                #[cfg(feature = "timing")]
+                let _ms = t_seg.elapsed().as_secs_f64() * 1000.0;
+                (output, comp_bits, out_len, _ms)
             })
             .collect();
+
+        #[cfg(feature = "timing")]
+        {
+            use std::io::Write;
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            static SEG_FILE: std::sync::Mutex<Option<std::fs::File>> = std::sync::Mutex::new(None);
+            ONCE.call_once(|| {
+                let mut f = std::fs::File::create("/tmp/lbzip2_segments.csv").unwrap();
+                writeln!(f, "chunk,segment,comp_kb,decomp_kb,ms").unwrap();
+                *SEG_FILE.lock().unwrap() = Some(f);
+            });
+            static CHUNK_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let cid = CHUNK_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if let Some(ref mut f) = *SEG_FILE.lock().unwrap() {
+                for (i, (_seg, comp_bits, decomp_bytes, ms)) in results.iter().enumerate() {
+                    writeln!(f, "{},{},{:.1},{:.1},{:.2}",
+                        cid, i,
+                        *comp_bits as f64 / 8.0 / 1024.0,
+                        *decomp_bytes as f64 / 1024.0,
+                        ms,
+                    ).unwrap();
+                }
+            }
+        }
+
+        let segments: Vec<Vec<u8>> = results.into_iter().map(|(data, _, _, _)| data).collect();
 
         let consumed = if decode_segments < n_segments {
             segment_starts[decode_segments].byte_offset()
@@ -156,7 +210,7 @@ impl ChunkDecoder {
             data.len()
         };
 
-        Ok((results, consumed))
+        Ok((segments, consumed))
     }
 
     /// Decode all complete bzip2 blocks in `data`.

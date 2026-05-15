@@ -37,11 +37,13 @@ OSM-to-GeoParquet pipeline.
 
 ## Performance
 
-| Test file | C lbzip2 | lbzip2-rs | Gap |
-|-----------|----------|-----------|-----|
-| Planet 1 GB slice (→ ~10 GB) | 40.6 s | 42.4 s | 4% slower |
-| Liechtenstein 3 MB (→ 60 MB) | 0.15 s | 0.22 s | startup |
-Within **4 %** of C lbzip2 on real workloads (8-core / 16-thread machine).
+| Test file | C lbzip2 | lbzip2-rs | |
+|-----------|----------|-----------|---|
+| Planet 1 GB slice (→ 9.86 GB) | 30.5 s (323 MB/s) | **30.3 s (325 MB/s)** | **0.6% faster** |
+| Liechtenstein 3 MB (→ 60 MB) | 0.15 s | 0.22 s | startup overhead |
+
+**Matches or beats** C lbzip2 on real workloads (8-core / 16-thread, NVMe, `/dev/null` output).
+4× oversplit work-stealing eliminates core idle time.
 Handles pbzip2 concatenated streams natively.
 
 **Current state:** the block-level decompression (Huffman → MTF → inverse

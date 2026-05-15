@@ -1,0 +1,31 @@
+[package]
+name = "lbzip2"
+version = "0.1.0"
+edition = "2024"
+description = "Pure Rust parallel bzip2 decompressor — SIMD block scanning, multi-core Burrows-Wheeler decode"
+license = "MIT OR Apache-2.0 AND bzip2-1.0.6"
+repository = "https://github.com/Ignalina/lbzip2-rs"
+homepage = "https://github.com/Ignalina/lbzip2-rs"
+documentation = "https://docs.rs/lbzip2"
+readme = "README.md"
+keywords = ["bzip2", "decompression", "parallel", "compression"]
+categories = ["compression", "encoding"]
+
+[dependencies]
+rayon = "1"
+memchr = "2"
+
+[dev-dependencies]
+bzip2 = "0.5"
+
+[[test]]
+name = "decompress_bench"
+path = "benches/decompress_bench.rs"
+
+[[test]]
+name = "profile_stages"
+path = "benches/profile_stages.rs"
+
+[[test]]
+name = "stage_breakdown"
+path = "benches/stage_breakdown.rs"

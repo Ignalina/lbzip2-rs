@@ -5,20 +5,36 @@
 //!
 //! Uses a flat lookup table for codes ≤ FAST_BITS with tree fallback for longer codes.
 
-/// Max bits for the fast lookup table.  12 covers the vast majority of bzip2 codes.
-const FAST_BITS: u8 = 12;
+/// Max bits for the fast lookup table. 10 keeps all 6 tables (12KB) in L1 cache.
+const FAST_BITS: u8 = 10;
+
+/// Pack symbol (9 bits) and length (5 bits) into a u16 for cache density.
+/// Bits [15:7] = symbol, bits [4:0] = length. Length 0 means tree fallback.
+#[inline(always)]
+fn pack_entry(symbol: u16, len: u8) -> u16 {
+    (symbol << 5) | len as u16
+}
+
+#[inline(always)]
+fn unpack_symbol(entry: u16) -> u16 {
+    entry >> 5
+}
+
+#[inline(always)]
+fn unpack_len(entry: u16) -> u8 {
+    (entry & 0x1F) as u8
+}
 
 /// A Huffman decoding tree with fast table lookup.
 pub struct HuffmanTree {
     /// Fast lookup: indexed by the top FAST_BITS of the bitstream.
-    /// Each entry: (symbol, bit_length).  If bit_length == 0 → need tree fallback.
-    fast_table: Vec<(u16, u8)>,
+    /// Each entry is a packed u16: symbol (bits 15:5) | length (bits 4:0).
+    /// Length 0 means tree fallback required.
+    fast_table: Vec<u16>,
     /// Slow path: flat node array.  Each node stores [left_child, right_child].
     /// Positive values = index of child node.
     /// Negative values = -(symbol + 1), i.e. a leaf.
     nodes: Vec<[i32; 2]>,
-    /// Minimum code length (for fast-path skip).
-    min_len: u8,
 }
 
 impl HuffmanTree {
@@ -79,34 +95,33 @@ impl HuffmanTree {
             code += 1;
         }
 
-        // Build fast lookup table
+        // Build fast lookup table (packed u16 entries)
         let table_size = 1usize << FAST_BITS;
-        let mut fast_table = vec![(0u16, 0u8); table_size];
+        let mut fast_table = vec![0u16; table_size];
 
         for &(c, len, sym) in &code_entries {
             if len <= FAST_BITS {
-                // This code maps to multiple table entries (padded with all suffix combinations)
                 let pad = FAST_BITS - len;
                 let base = (c as usize) << pad;
+                let entry = pack_entry(sym, len);
                 for suffix in 0..(1usize << pad) {
-                    fast_table[base | suffix] = (sym, len);
+                    fast_table[base | suffix] = entry;
                 }
             }
         }
 
-        Ok(Self { fast_table, nodes, min_len })
+        Ok(Self { fast_table, nodes })
     }
 
     /// Decode one symbol using fast table lookup with tree fallback.
     #[inline(always)]
     pub fn decode(&self, reader: &mut super::bitreader::BitReader<'_>) -> Option<u16> {
-        // Try peek FAST_BITS from the stream
         if let Some(bits) = reader.peek(FAST_BITS) {
-            let entry = unsafe { self.fast_table.get_unchecked(bits as usize) };
-            if entry.1 > 0 {
-                // Fast path: symbol found in table
-                reader.consume(entry.1);
-                return Some(entry.0);
+            let entry = unsafe { *self.fast_table.get_unchecked(bits as usize) };
+            let len = unpack_len(entry);
+            if len > 0 {
+                reader.consume(len);
+                return Some(unpack_symbol(entry));
             }
         }
 

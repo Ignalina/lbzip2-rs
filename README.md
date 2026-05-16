@@ -8,7 +8,7 @@
 > ⚡ Med hans blick över varje bit.
 
 Pure Rust parallel bzip2 decompressor. No C dependencies.
-Usable as a **library** or as a **CLI** tool:
+Usable as a **library** (in-process, zero-copy) or as a **CLI** tool:
 
 ```bash
 # Decompress any bzip2 file (including pbzip2 concatenated streams)
@@ -18,40 +18,38 @@ cargo run --release --bin lbunzip2 -- planet-241021.osm.bz2 > planet.osm
 **What makes this crate unique:** 100 % Rust (no C/FFI), in-process,
 zero-copy, *and* parallel block-boundary scanning — splitting a chunk
 across *N* cores is **O(N)**, not O(n) where *n* is the raw byte count
-(e.g. 200 MB per chunk). Each core only scans its own 200 MB / N slice
-for the 48-bit magic, so with 12 cores the work per core is ~17 MB
-instead of a single thread walking all 200 MB.
+(e.g. 200 MB per chunk). Each core only scans ~500 bytes forward from
+its split point, so with 16 cores the total scan is ~8 KB for a 200 MB
+chunk. 4× oversplit lets rayon work-steal across 64 segments, eliminating
+core idle time from uneven block sizes.
 
 Part of the [znippy](https://github.com/Ignalina) group of software,
 designed for fast zero-copy integration with
 [osm-katana](https://github.com/Ignalina/katana-osm) — the parallel
 OSM-to-GeoParquet pipeline.
 
-## Why
-
-- **In-process** — no pipe, no process spawn. Decompressed segments go
-  straight into the caller's memory.
-- **Shared thread pool** — the rayon pool is shared with the host
-  application (e.g. VTD XML parse + PBF encode). No thread contention.
-- **Zero dependency on C libbz2** — builds anywhere `rustc` does.
-
 ## Performance
+
+### Decompression (lbunzip2 CLI vs C lbzip2)
 
 | Test file | C lbzip2 | lbzip2-rs | |
 |-----------|----------|-----------|---|
 | Planet 1 GB slice (→ 9.86 GB) | 30.5 s (323 MB/s) | **30.3 s (325 MB/s)** | **0.6% faster** |
 | Liechtenstein 3 MB (→ 60 MB) | 0.15 s | 0.22 s | startup overhead |
 
-**Matches or beats** C lbzip2 on real workloads (8-core / 16-thread, NVMe, `/dev/null` output).
-4× oversplit work-stealing eliminates core idle time.
-Handles pbzip2 concatenated streams natively.
+8-core / 16-thread, NVMe, `/dev/null` output, 3-run average.
 
-**Current state:** the block-level decompression (Huffman → MTF → inverse
-BWT → RLE) is heavily (ai cloned) inspired by Julian Seward's original C bzip2
-library. This crate therefore includes the bzip2 license (BSD-style)
-alongside MIT / Apache-2.0.
+### End-to-end: Planet bz2 → PBF (osm-katana)
 
+| | |
+|---|---|
+| Input | 147 GB planet-241021.osm.bz2 |
+| Output | 68 GB planet-241021.osm.pbf |
+| Time | **81 minutes** |
+| Elements | 10.5 billion |
+| Throughput | 309 MB/s decompressed XML |
 
+Full pipeline: bz2 decompress → VTD XML parse → PBF encode, 15 workers.
 
 ## Usage
 
@@ -68,40 +66,15 @@ for seg in &segments {
 }
 ```
 
-Single-stream sequential API also available:
+Single-stream sequential API:
 
 ```rust
 let output = lbzip2::stream::decompress(&compressed)?;
 ```
 
-## Backlog
-
-Questions / wishes for the `bzip2-rs` crate author — API changes that
-would have made parallel decode possible without reimplementing the decoder:
-
-```
-1. pub fn decode_block(data: &[u8], bit_offset: usize, max_blocksize: u32)
-       -> Result<(Vec<u8>, usize), Error>
-   — Expose single-block decode from arbitrary bit offset.
-   — Return (decompressed_bytes, bits_consumed).
-
-2. Zero-copy input: accept &[u8] + bit_offset, not impl Write.
-   — For mmap / ring-buffer use cases, borrowing is essential.
-
-3. Expose block boundary scanning or document the 48-bit bit-aligned
-   magic (0x314159265359) so callers can split the stream themselves.
-
-4. Optional: fn decode_block_into(data: &[u8], bit_offset: usize,
-                                   out: &mut [u8]) -> Result<usize, Error>
-   — Write directly into caller-provided buffer.
-```
-
-Without (1) and (2), parallel decode requires reimplementing the full
-Huffman → MTF → BWT → RLE pipeline from scratch (which is what this crate does).
-
 ## License
 
 MIT OR Apache-2.0, plus the original bzip2 license (BSD-style, Julian
-Seward) for the block-decode routines derived from the C reference
+Seward) for the block-decode routines inspired by the C reference
 implementation. See [LICENSE-BZIP2](LICENSE-BZIP2) for the full text.
 

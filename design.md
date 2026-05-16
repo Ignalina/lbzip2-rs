@@ -140,3 +140,35 @@ src/
 ├── reader.rs        # Streaming/mmap reader interfaces
 └── stream.rs        # Single-stream sequential decoder
 ```
+
+## Backlog / Wishes for bzip2-rs crate
+
+Questions / wishes for the `bzip2-rs` crate author — API changes that
+would have made parallel decode possible without reimplementing the decoder:
+
+```
+1. pub fn decode_block(data: &[u8], bit_offset: usize, max_blocksize: u32)
+       -> Result<(Vec<u8>, usize), Error>
+   — Expose single-block decode from arbitrary bit offset.
+   — Return (decompressed_bytes, bits_consumed).
+
+2. Zero-copy input: accept &[u8] + bit_offset, not impl Write.
+   — For mmap / ring-buffer use cases, borrowing is essential.
+
+3. Expose block boundary scanning or document the 48-bit bit-aligned
+   magic (0x314159265359) so callers can split the stream themselves.
+
+4. Optional: fn decode_block_into(data: &[u8], bit_offset: usize,
+                                   out: &mut [u8]) -> Result<usize, Error>
+   — Write directly into caller-provided buffer.
+```
+
+Without (1) and (2), parallel decode requires reimplementing the full
+Huffman → MTF → BWT → RLE pipeline from scratch (which is what this crate does).
+
+## Future: iBWT Prefetch Optimization
+
+C lbzip2 uses cache-line prefetch hints during the inverse BWT pointer chase.
+Our iBWT is a clean but straightforward implementation without prefetching.
+Adding `_mm_prefetch` / `prefetch_read_data` could close the remaining per-core
+gap and push throughput beyond C lbzip2 on all workloads.

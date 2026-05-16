@@ -43,7 +43,8 @@ pub fn decompress_parallel(data: &[u8]) -> Result<Vec<u8>, BlockError> {
     }
 
     // ── Parallel decode ─────────────────────────────────────────────────
-    let results: Vec<Result<Vec<u8>, BlockError>> = boundaries
+    let results: Vec<Result<Vec<u8>, BlockError>> = crate::thread_pool().install(|| {
+        boundaries
         .par_iter()
         .map(|boundary| {
             // Position reader right after the 48-bit block magic
@@ -51,7 +52,8 @@ pub fn decompress_parallel(data: &[u8]) -> Result<Vec<u8>, BlockError> {
             let mut reader = BitReader::from_bit_offset(data, bit_after_magic as usize);
             block::decode_block(&mut reader, max_blocksize)
         })
-        .collect();
+        .collect()
+    });
 
     // ── Assemble output in order ────────────────────────────────────────
     let mut total_size = 0usize;

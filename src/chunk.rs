@@ -63,7 +63,7 @@ impl ChunkDecoder {
             None => return Ok((Vec::new(), 0)),
         };
 
-        let n_threads = rayon::current_num_threads();
+        let n_threads = crate::thread_pool().current_num_threads();
         // Oversplit: more segments than cores lets rayon work-steal for balance.
         // Tunable via LBZIP2_OVERSPLIT env var (default 4).
         let oversplit: usize = std::env::var("LBZIP2_OVERSPLIT")
@@ -78,7 +78,9 @@ impl ChunkDecoder {
         #[cfg(feature = "timing")]
         let t0 = std::time::Instant::now();
 
-        let splits = block_scan::split_boundaries_parallel(data, n_splits, max_bs);
+        let splits = crate::thread_pool().install(||
+            block_scan::split_boundaries_parallel(data, n_splits, max_bs)
+        );
 
         #[cfg(feature = "timing")]
         eprintln!(
@@ -119,7 +121,8 @@ impl ChunkDecoder {
         };
 
         // ── Parallel decode — one thread per segment ────────────────────
-        let results: Vec<(Vec<u8>, u64, u64, f64)> = (0..decode_segments)
+        let results: Vec<(Vec<u8>, u64, u64, f64)> = crate::thread_pool().install(|| {
+            (0..decode_segments)
             .into_par_iter()
             .map(|i| {
                 #[cfg(feature = "timing")]
@@ -181,7 +184,8 @@ impl ChunkDecoder {
                 let _ms = t_seg.elapsed().as_secs_f64() * 1000.0;
                 (output, comp_bits, out_len, _ms)
             })
-            .collect();
+            .collect()
+        });
 
         #[cfg(feature = "timing")]
         {

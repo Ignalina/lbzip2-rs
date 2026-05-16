@@ -93,7 +93,8 @@ pub fn find_all_blocks_parallel(buf: &[u8], n_threads: usize) -> Vec<BlockBounda
 
     let chunk_size = buf.len() / n;
 
-    let mut per_thread: Vec<Vec<BlockBoundary>> = (0..n)
+    let mut per_thread: Vec<Vec<BlockBoundary>> = crate::thread_pool().install(|| {
+        (0..n)
         .into_par_iter()
         .map(|i| {
             let start_byte = i * chunk_size;
@@ -120,9 +121,8 @@ pub fn find_all_blocks_parallel(buf: &[u8], n_threads: usize) -> Vec<BlockBounda
             }
             result
         })
-        .collect();
-
-    // Merge and deduplicate (chunks overlap by 8 bytes)
+        .collect()
+    });
     let mut all: Vec<BlockBoundary> = per_thread.drain(..).flatten().collect();
     all.sort_by_key(|b| b.bit_offset);
     all.dedup_by_key(|b| b.bit_offset);
@@ -239,13 +239,15 @@ pub fn split_boundaries_parallel(
 
     let total_bits = buf.len() as u64 * 8;
 
-    let mut boundaries: Vec<Option<BlockBoundary>> = (1..n_splits)
+    let mut boundaries: Vec<Option<BlockBoundary>> = crate::thread_pool().install(|| {
+        (1..n_splits)
         .into_par_iter()
         .map(|i| {
             let nominal_bit = total_bits * i as u64 / n_splits as u64;
             find_quick_boundary(buf, nominal_bit, max_blocksize)
         })
-        .collect();
+        .collect()
+    });
 
     // Filter, sort, deduplicate
     let mut result: Vec<BlockBoundary> = boundaries.drain(..).flatten().collect();

@@ -65,7 +65,12 @@ impl ChunkDecoder {
 
         let n_threads = rayon::current_num_threads();
         // Oversplit: more segments than cores lets rayon work-steal for balance.
-        let n_splits = n_threads * 4;
+        // Tunable via LBZIP2_OVERSPLIT env var (default 4).
+        let oversplit: usize = std::env::var("LBZIP2_OVERSPLIT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8);
+        let n_splits = n_threads * oversplit;
         let max_bs = self.max_blocksize;
         let total_bits = data.len() as u64 * 8;
 

@@ -104,11 +104,11 @@ compressed &[u8]
           ▼
  ┌────────────────────┐
  │  rayon par_iter     │  N segments decoded concurrently
- │  BitReader          │  64-bit buffered, zero-copy from &[u8]
- │  → Huffman (table)  │  12-bit fast lookup, tree fallback
- │  → MTF decode       │
+ │  BitReader          │  64-bit buffered, bulk 8-byte refill, zero-copy from &[u8]
+ │  → Huffman (table)  │  10-bit packed lookup, tree fallback
+ │  → MTF decode       │  fast-path n=0/n=1
  │  → inverse BWT      │
- │  → RLE2             │
+ │  → RLE2 (prefetch)  │  2-step lookahead, raw pointer output
  └────────┬───────────┘
           │  Vec<Vec<u8>>  (ordered segments)
           ▼
@@ -117,9 +117,13 @@ compressed &[u8]
 
 ## Optimizations
 
-- **BitReader**: 64-bit shift register with bulk refill (vs per-bit byte lookup)
-- **Huffman**: 12-bit flat lookup table, cold tree fallback for codes >12 bits
-- **BWT pointer chase**: raw pointer with `unsafe` bounds elision
+- **BitReader**: 64-bit shift register with bulk 8-byte refill (single load vs byte-at-a-time loop)
+- **Huffman**: 10-bit packed `u16` lookup table (2 KB/table, all 6 fit L1), cold tree fallback for codes >10 bits
+- **MTF**: fast-path for n=0 (no-op return) and n=1 (swap), the two most common indices
+- **Decode loop**: group-of-50 inner loop — fixed tree pointer, no per-symbol counter check
+- **BWT pointer chase**: 2-step prefetch lookahead hides L3 latency on the 3.6 MB random-access `tt` array
+- **RLE2 output**: raw pointer writes (no Vec bounds check per byte), `memset` for repeat runs
+- **Thread-local tt buffers**: reuse the 3.6 MB `tt` Vec across blocks on the same thread (no alloc/free per block)
 - **Block scan**: 64-bit sliding window, 16-way unrolled per 2-byte step
 - **Split verification**: 73-bit header check, not full trial-decode
 - **Segment output**: `decode_chunk_segments()` returns Vec<Vec<u8>> — no single-thread assembly
@@ -166,9 +170,42 @@ would have made parallel decode possible without reimplementing the decoder:
 Without (1) and (2), parallel decode requires reimplementing the full
 Huffman → MTF → BWT → RLE pipeline from scratch (which is what this crate does).
 
-## Future: iBWT Prefetch Optimization
+## Performance: Adapting 1996 Algorithms to Modern Hardware
 
-C lbzip2 uses cache-line prefetch hints during the inverse BWT pointer chase.
-Our iBWT is a clean but straightforward implementation without prefetching.
-Adding `_mm_prefetch` / `prefetch_read_data` could close the remaining per-core
-gap and push throughput beyond C lbzip2 on all workloads.
+The original bzip2 was written by Julian Seward in 1996 for CPUs where computation
+was the bottleneck and memory was fast relative to the clock. Modern hardware has
+inverted this: CPUs are wide and fast, but memory latency (100+ cycles to L3)
+dominates. The algorithm is identical — these optimizations adapt the *mechanics*
+to 2020s hardware.
+
+| Optimization | Hardware shift since '96 | What we changed |
+|---|---|---|
+| **Thread-local buffer pool** | RAM is cheap, cores are many | Reuse 3.6 MB `tt` buffers per thread instead of alloc/free per block |
+| **2-step prefetch lookahead** | L3 latency now 100+ cycles vs ~10 in '96 | Prefetch the BWT pointer chain 2 hops ahead — hide L3 latency |
+| **Packed Huffman tables** | L1 cache is precious (32–48 KB) | Pack entries into `u16`, shrink from 96 KB → 12 KB — all 6 tables fit L1 |
+| **64-bit bulk bitreader** | Registers are 64-bit | Load 8 bytes in one shot instead of byte-at-a-time loop |
+| **Raw pointer output** | Branch prediction is deep but mispredicts are costly | Skip Vec bounds check per byte, `memset` for repeat runs |
+| **MTF fast paths** | Branch prediction loves hot paths | Special-case n=0 (no-op) and n=1 (swap) — the two most common indices |
+| **Group-of-50 inner loop** | Tight loops let the CPU speculate and prefetch better | Eliminate per-symbol counter check; fixed tree pointer for 50 symbols |
+
+### Benchmark (liechtenstein.osm.bz2, 5.2 MB → 60 MB)
+
+| Mode | Throughput | vs C libbz2 |
+|---|---|---|
+| C libbz2 (single-thread) | 108 MB/s | 1.0× |
+| lbzip2-rs (single-thread) | 141 MB/s | 1.3× |
+| lbzip2-rs (parallel, 12 threads) | 704 MB/s | 6.5× |
+
+### Stage breakdown (single-thread, 71 blocks)
+
+| Stage | Time | % |
+|---|---|---|
+| Header + bitmap + selectors + trees | 3 ms | 0.8% |
+| Huffman decode + MTF + RLE1 | 105 ms | 26% |
+| Inverse BWT | 35 ms | 9% |
+| RLE2 + output | 260 ms | 64% |
+| **Total** | **403 ms** | |
+
+The RLE2 stage dominates because the inverse BWT traversal is a dependent pointer
+chain through a 3.6 MB array — fundamentally memory-latency-bound. The 2-step
+prefetch hides most of L3 latency but cannot eliminate the serial dependency.

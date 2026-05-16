@@ -2,13 +2,13 @@
 //! Run: cargo test --release stage_breakdown -- --nocapture --ignored
 
 use std::time::{Duration, Instant};
-use lbzip2_rs::bitreader::BitReader;
-use lbzip2_rs::block;
-use lbzip2_rs::bwt;
-use lbzip2_rs::huffman::HuffmanTree;
-use lbzip2_rs::mtf::MtfDecoder;
-use lbzip2_rs::BLOCK_MAGIC;
-use lbzip2_rs::FINAL_MAGIC;
+use lbzip2::bitreader::BitReader;
+use lbzip2::block;
+use lbzip2::bwt;
+use lbzip2::huffman::HuffmanTree;
+use lbzip2::mtf::MtfDecoder;
+use lbzip2::BLOCK_MAGIC;
+use lbzip2::FINAL_MAGIC;
 
 #[test]
 #[ignore]

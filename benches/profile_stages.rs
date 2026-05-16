@@ -3,10 +3,10 @@
 //! Run: cargo test --release profile_stages -- --nocapture --ignored
 
 use std::time::Instant;
-use lbzip2_rs::bitreader::BitReader;
-use lbzip2_rs::block;
-use lbzip2_rs::BLOCK_MAGIC;
-use lbzip2_rs::FINAL_MAGIC;
+use lbzip2::bitreader::BitReader;
+use lbzip2::block;
+use lbzip2::BLOCK_MAGIC;
+use lbzip2::FINAL_MAGIC;
 
 #[test]
 #[ignore]
@@ -34,7 +34,7 @@ fn profile_stages() {
     let mut times = Vec::new();
     for _ in 0..5 {
         let start = Instant::now();
-        let _ = lbzip2_rs::stream::decompress(data).unwrap();
+        let _ = lbzip2::stream::decompress(data).unwrap();
         times.push(start.elapsed());
     }
     let best = times.iter().min().unwrap();

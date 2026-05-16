@@ -56,14 +56,25 @@ impl<'a> BitReader<'a> {
     }
 
     /// Refill the buffer from the byte stream.
-    /// Loads as many full bytes as fit into the empty portion of buf.
+    /// Bulk-loads up to 8 bytes in a single read when possible.
     #[inline(always)]
     fn refill(&mut self) {
-        // Fast path: load 8 bytes at once if available
-        while self.bits_in_buf <= 56 && self.byte_pos < self.bytes.len() {
-            self.buf |= (self.bytes[self.byte_pos] as u64) << (56 - self.bits_in_buf);
-            self.byte_pos += 1;
-            self.bits_in_buf += 8;
+        if self.byte_pos + 8 <= self.bytes.len() {
+            // Fast path: single 8-byte big-endian load
+            let word = u64::from_be_bytes(
+                unsafe { *(self.bytes.as_ptr().add(self.byte_pos) as *const [u8; 8]) }
+            );
+            self.buf |= word >> self.bits_in_buf;
+            let loaded = ((64 - self.bits_in_buf) / 8) as usize;
+            self.byte_pos += loaded;
+            self.bits_in_buf += (loaded * 8) as u8;
+        } else {
+            // Near end of stream: byte-at-a-time fallback
+            while self.bits_in_buf <= 56 && self.byte_pos < self.bytes.len() {
+                self.buf |= (self.bytes[self.byte_pos] as u64) << (56 - self.bits_in_buf);
+                self.byte_pos += 1;
+                self.bits_in_buf += 8;
+            }
         }
     }
 

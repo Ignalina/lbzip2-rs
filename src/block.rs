@@ -11,8 +11,34 @@ use crate::bwt;
 use crate::huffman::HuffmanTree;
 use crate::mtf::MtfDecoder;
 
+use std::cell::RefCell;
+
 /// Maximum block size: 9 × 100,000 bytes.
 const MAX_BLOCKSIZE: usize = 900_000;
+
+thread_local! {
+    static TT_BUF: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Take a `tt` buffer from the thread-local pool, avoiding repeated heap allocation.
+fn take_tt_buffer(capacity: usize) -> Vec<u32> {
+    TT_BUF.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let mut buf = std::mem::take(&mut *slot);
+        buf.clear();
+        if buf.capacity() < capacity {
+            buf.reserve(capacity - buf.len());
+        }
+        buf
+    })
+}
+
+/// Return a `tt` buffer to the thread-local pool for reuse.
+fn return_tt_buffer(buf: Vec<u32>) {
+    TT_BUF.with(|cell| {
+        *cell.borrow_mut() = buf;
+    });
+}
 
 /// Error type for block decoding.
 #[derive(Debug)]
@@ -123,7 +149,7 @@ pub fn decode_block(reader: &mut BitReader<'_>, max_blocksize: u32) -> Result<Ve
     }
 
     // ── Huffman decode → MTF + RLE1 decode → tt array ─────────────────────
-    let mut tt: Vec<u32> = Vec::with_capacity(max_blocksize as usize);
+    let mut tt: Vec<u32> = take_tt_buffer(max_blocksize as usize);
     let mut c = [0u32; 256]; // byte frequency counts for BWT
 
     // Build MTF decoder with the actual used-byte alphabet.
@@ -132,7 +158,6 @@ pub fn decode_block(reader: &mut BitReader<'_>, max_blocksize: u32) -> Result<Ve
     let mut mtf = MtfDecoder::with_symbols(byte_symbols);
 
     let mut sel_idx: usize = 0;
-    let mut decoded_in_group: usize = 0;
     let mut current_tree = trees.get(
         *selectors.first().ok_or(BlockError("no selectors"))? as usize
     ).ok_or(BlockError("selector out of range"))?;
@@ -142,59 +167,57 @@ pub fn decode_block(reader: &mut BitReader<'_>, max_blocksize: u32) -> Result<Ve
 
     let eob_symbol = (n_symbols - 1) as u16;
 
-    loop {
-        // Switch Huffman table every 50 symbols.
-        if decoded_in_group == 50 {
-            sel_idx += 1;
-            let sel = *selectors.get(sel_idx)
-                .ok_or(BlockError("ran out of selectors"))? as usize;
-            current_tree = trees.get(sel)
-                .ok_or(BlockError("selector out of range"))?;
-            decoded_in_group = 0;
-        }
+    'outer: loop {
+        for _ in 0..50 {
+            let sym = current_tree.decode(reader)
+                .ok_or(BlockError("huffman bitstream truncated"))?;
 
-        let sym = current_tree.decode(reader)
-            .ok_or(BlockError("huffman bitstream truncated"))?;
-        decoded_in_group += 1;
+            // RUNA (0) or RUNB (1): run-length encoding.
+            if sym < 2 {
+                if repeat == 0 {
+                    repeat_power = 1;
+                }
+                repeat += repeat_power << sym;
+                repeat_power <<= 1;
 
-        // RUNA (0) or RUNB (1): run-length encoding.
-        if sym < 2 {
-            if repeat == 0 {
-                repeat_power = 1;
+                if repeat as usize > MAX_BLOCKSIZE {
+                    return Err(BlockError("repeat count too large"));
+                }
+                continue;
             }
-            repeat += repeat_power << sym;
-            repeat_power <<= 1;
 
-            if repeat as usize > MAX_BLOCKSIZE {
-                return Err(BlockError("repeat count too large"));
+            // Flush pending run.
+            if repeat > 0 {
+                let b = mtf.first();
+                if tt.len() + repeat as usize > max_blocksize as usize {
+                    return Err(BlockError("data exceeds block size"));
+                }
+                let new_len = tt.len() + repeat as usize;
+                tt.resize(new_len, u32::from(b));
+                c[b as usize] += repeat;
+                repeat = 0;
             }
-            continue;
-        }
 
-        // Flush pending run.
-        if repeat > 0 {
-            let b = mtf.first();
-            if tt.len() + repeat as usize > max_blocksize as usize {
+            // EOB: end of block.
+            if sym == eob_symbol {
+                break 'outer;
+            }
+
+            // Regular symbol: MTF decode.
+            let b = mtf.decode((sym - 1) as u8);
+            if tt.len() >= max_blocksize as usize {
                 return Err(BlockError("data exceeds block size"));
             }
-            let new_len = tt.len() + repeat as usize;
-            tt.resize(new_len, u32::from(b));
-            c[b as usize] += repeat;
-            repeat = 0;
+            tt.push(u32::from(b));
+            c[b as usize] += 1;
         }
 
-        // EOB: end of block.
-        if sym == eob_symbol {
-            break;
-        }
-
-        // Regular symbol: MTF decode.
-        let b = mtf.decode((sym - 1) as u8);
-        if tt.len() >= max_blocksize as usize {
-            return Err(BlockError("data exceeds block size"));
-        }
-        tt.push(u32::from(b));
-        c[b as usize] += 1;
+        // Switch Huffman table for next group of 50 symbols.
+        sel_idx += 1;
+        let sel = *selectors.get(sel_idx)
+            .ok_or(BlockError("ran out of selectors"))? as usize;
+        current_tree = trees.get(sel)
+            .ok_or(BlockError("selector out of range"))?;
     }
 
     if orig_ptr >= tt.len() {
@@ -205,10 +228,15 @@ pub fn decode_block(reader: &mut BitReader<'_>, max_blocksize: u32) -> Result<Ve
     let mut t_pos = bwt::inverse_bwt(&mut tt, orig_ptr, c);
 
     // ── RLE2 decode (bzip2 run-length post-processing) ────────────────────
-    let mut output = Vec::with_capacity(tt.len());
-    let mut last_byte: i16 = -1;
-    let mut byte_repeats: u8 = 0;
+    // Pre-allocate generously: n bytes for 1-per-iteration + headroom for repeats.
+    // Use raw pointer writes to skip Vec::push bounds check on every byte.
     let n = tt.len();
+    let out_cap = n + n / 4;
+    let mut output = Vec::<u8>::with_capacity(out_cap);
+    let mut out_len: usize = 0;
+    let mut last_byte: u8 = 0;
+    let mut has_last = false;
+    let mut byte_repeats: u8 = 0;
     let tt_ptr = tt.as_ptr();
 
     for _ in 0..n {
@@ -216,26 +244,47 @@ pub fn decode_block(reader: &mut BitReader<'_>, max_blocksize: u32) -> Result<Ve
         let b = entry as u8;
         t_pos = entry >> 8;
 
+        // Two-step prefetch: read next entry (should be L1 from previous prefetch)
+        // and prefetch the entry *after* that, giving L3 two iterations to respond.
+        let next_entry = unsafe { *tt_ptr.add(t_pos as usize) };
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            std::arch::x86_64::_mm_prefetch(
+                tt_ptr.add((next_entry >> 8) as usize) as *const i8,
+                std::arch::x86_64::_MM_HINT_T0,
+            );
+        }
+
         if byte_repeats == 3 {
             let count = b as usize;
-            let lb = last_byte as u8;
-            for _ in 0..count {
-                output.push(lb);
+            // Grow if repeat expansion would exceed capacity
+            if out_len + count > output.capacity() {
+                unsafe { output.set_len(out_len); }
+                output.reserve(count);
             }
+            unsafe {
+                std::ptr::write_bytes(output.as_mut_ptr().add(out_len), last_byte, count);
+            }
+            out_len += count;
             byte_repeats = 0;
-            last_byte = -1;
+            has_last = false;
             continue;
         }
 
-        if last_byte == i16::from(b) {
+        if has_last && last_byte == b {
             byte_repeats += 1;
         } else {
             byte_repeats = 0;
         }
-        last_byte = i16::from(b);
-        output.push(b);
+        last_byte = b;
+        has_last = true;
+        // Direct write — capacity guaranteed: out_len ≤ iteration count ≤ n < out_cap
+        unsafe { *output.as_mut_ptr().add(out_len) = b; }
+        out_len += 1;
     }
 
+    unsafe { output.set_len(out_len); }
+    return_tt_buffer(tt);
     Ok(output)
 }
 

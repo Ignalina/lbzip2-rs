@@ -228,11 +228,15 @@ pub fn decode_block(reader: &mut BitReader<'_>, max_blocksize: u32) -> Result<Ve
     let mut t_pos = bwt::inverse_bwt(&mut tt, orig_ptr, c);
 
     // ── RLE2 decode (bzip2 run-length post-processing) ────────────────────
-    let mut output = Vec::with_capacity(tt.len() + tt.len() / 8);
+    // Pre-allocate generously: n bytes for 1-per-iteration + headroom for repeats.
+    // Use raw pointer writes to skip Vec::push bounds check on every byte.
+    let n = tt.len();
+    let out_cap = n + n / 4;
+    let mut output = Vec::<u8>::with_capacity(out_cap);
+    let mut out_len: usize = 0;
     let mut last_byte: u8 = 0;
     let mut has_last = false;
     let mut byte_repeats: u8 = 0;
-    let n = tt.len();
     let tt_ptr = tt.as_ptr();
 
     for _ in 0..n {
@@ -240,18 +244,28 @@ pub fn decode_block(reader: &mut BitReader<'_>, max_blocksize: u32) -> Result<Ve
         let b = entry as u8;
         t_pos = entry >> 8;
 
-        // Prefetch next entry to hide memory latency in BWT pointer chain
+        // Two-step prefetch: read next entry (should be L1 from previous prefetch)
+        // and prefetch the entry *after* that, giving L3 two iterations to respond.
+        let next_entry = unsafe { *tt_ptr.add(t_pos as usize) };
         #[cfg(target_arch = "x86_64")]
         unsafe {
             std::arch::x86_64::_mm_prefetch(
-                tt_ptr.add(t_pos as usize) as *const i8,
+                tt_ptr.add((next_entry >> 8) as usize) as *const i8,
                 std::arch::x86_64::_MM_HINT_T0,
             );
         }
 
         if byte_repeats == 3 {
             let count = b as usize;
-            output.resize(output.len() + count, last_byte);
+            // Grow if repeat expansion would exceed capacity
+            if out_len + count > output.capacity() {
+                unsafe { output.set_len(out_len); }
+                output.reserve(count);
+            }
+            unsafe {
+                std::ptr::write_bytes(output.as_mut_ptr().add(out_len), last_byte, count);
+            }
+            out_len += count;
             byte_repeats = 0;
             has_last = false;
             continue;
@@ -264,9 +278,12 @@ pub fn decode_block(reader: &mut BitReader<'_>, max_blocksize: u32) -> Result<Ve
         }
         last_byte = b;
         has_last = true;
-        output.push(b);
+        // Direct write — capacity guaranteed: out_len ≤ iteration count ≤ n < out_cap
+        unsafe { *output.as_mut_ptr().add(out_len) = b; }
+        out_len += 1;
     }
 
+    unsafe { output.set_len(out_len); }
     return_tt_buffer(tt);
     Ok(output)
 }

@@ -23,10 +23,18 @@ impl MtfDecoder {
     }
 
     /// Decode: return the symbol at position `n`, then move it to front.
-    #[inline]
+    #[inline(always)]
     pub fn decode(&mut self, n: u8) -> u8 {
         let idx = n as usize;
         let b = self.symbols[idx];
+        if idx == 0 {
+            return b;
+        }
+        if idx == 1 {
+            self.symbols[1] = self.symbols[0];
+            self.symbols[0] = b;
+            return b;
+        }
         // Shift symbols[0..idx] right by one, place b at front.
         self.symbols.copy_within(..idx, 1);
         self.symbols[0] = b;

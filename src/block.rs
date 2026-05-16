@@ -158,7 +158,6 @@ pub fn decode_block(reader: &mut BitReader<'_>, max_blocksize: u32) -> Result<Ve
     let mut mtf = MtfDecoder::with_symbols(byte_symbols);
 
     let mut sel_idx: usize = 0;
-    let mut decoded_in_group: usize = 0;
     let mut current_tree = trees.get(
         *selectors.first().ok_or(BlockError("no selectors"))? as usize
     ).ok_or(BlockError("selector out of range"))?;
@@ -168,59 +167,57 @@ pub fn decode_block(reader: &mut BitReader<'_>, max_blocksize: u32) -> Result<Ve
 
     let eob_symbol = (n_symbols - 1) as u16;
 
-    loop {
-        // Switch Huffman table every 50 symbols.
-        if decoded_in_group == 50 {
-            sel_idx += 1;
-            let sel = *selectors.get(sel_idx)
-                .ok_or(BlockError("ran out of selectors"))? as usize;
-            current_tree = trees.get(sel)
-                .ok_or(BlockError("selector out of range"))?;
-            decoded_in_group = 0;
-        }
+    'outer: loop {
+        for _ in 0..50 {
+            let sym = current_tree.decode(reader)
+                .ok_or(BlockError("huffman bitstream truncated"))?;
 
-        let sym = current_tree.decode(reader)
-            .ok_or(BlockError("huffman bitstream truncated"))?;
-        decoded_in_group += 1;
+            // RUNA (0) or RUNB (1): run-length encoding.
+            if sym < 2 {
+                if repeat == 0 {
+                    repeat_power = 1;
+                }
+                repeat += repeat_power << sym;
+                repeat_power <<= 1;
 
-        // RUNA (0) or RUNB (1): run-length encoding.
-        if sym < 2 {
-            if repeat == 0 {
-                repeat_power = 1;
+                if repeat as usize > MAX_BLOCKSIZE {
+                    return Err(BlockError("repeat count too large"));
+                }
+                continue;
             }
-            repeat += repeat_power << sym;
-            repeat_power <<= 1;
 
-            if repeat as usize > MAX_BLOCKSIZE {
-                return Err(BlockError("repeat count too large"));
+            // Flush pending run.
+            if repeat > 0 {
+                let b = mtf.first();
+                if tt.len() + repeat as usize > max_blocksize as usize {
+                    return Err(BlockError("data exceeds block size"));
+                }
+                let new_len = tt.len() + repeat as usize;
+                tt.resize(new_len, u32::from(b));
+                c[b as usize] += repeat;
+                repeat = 0;
             }
-            continue;
-        }
 
-        // Flush pending run.
-        if repeat > 0 {
-            let b = mtf.first();
-            if tt.len() + repeat as usize > max_blocksize as usize {
+            // EOB: end of block.
+            if sym == eob_symbol {
+                break 'outer;
+            }
+
+            // Regular symbol: MTF decode.
+            let b = mtf.decode((sym - 1) as u8);
+            if tt.len() >= max_blocksize as usize {
                 return Err(BlockError("data exceeds block size"));
             }
-            let new_len = tt.len() + repeat as usize;
-            tt.resize(new_len, u32::from(b));
-            c[b as usize] += repeat;
-            repeat = 0;
+            tt.push(u32::from(b));
+            c[b as usize] += 1;
         }
 
-        // EOB: end of block.
-        if sym == eob_symbol {
-            break;
-        }
-
-        // Regular symbol: MTF decode.
-        let b = mtf.decode((sym - 1) as u8);
-        if tt.len() >= max_blocksize as usize {
-            return Err(BlockError("data exceeds block size"));
-        }
-        tt.push(u32::from(b));
-        c[b as usize] += 1;
+        // Switch Huffman table for next group of 50 symbols.
+        sel_idx += 1;
+        let sel = *selectors.get(sel_idx)
+            .ok_or(BlockError("ran out of selectors"))? as usize;
+        current_tree = trees.get(sel)
+            .ok_or(BlockError("selector out of range"))?;
     }
 
     if orig_ptr >= tt.len() {

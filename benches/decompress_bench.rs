@@ -16,12 +16,12 @@ fn decompress_bzip2_crate(data: &[u8]) -> Vec<u8> {
 
 /// Our sequential decompressor.
 fn decompress_sequential(data: &[u8]) -> Vec<u8> {
-    lbzip2_rs::stream::decompress(data).expect("lbzip2-rs decompress failed")
+    lbzip2::stream::decompress(data).expect("lbzip2-rs decompress failed")
 }
 
 /// Our parallel decompressor.
 fn decompress_parallel(data: &[u8]) -> Vec<u8> {
-    lbzip2_rs::parallel::decompress_parallel(data).expect("lbzip2-rs parallel decompress failed")
+    lbzip2::parallel::decompress_parallel(data).expect("lbzip2-rs parallel decompress failed")
 }
 
 #[test]

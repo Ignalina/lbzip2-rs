@@ -1,6 +1,6 @@
 [package]
 name = "lbzip2"
-version = "0.2.0"
+version = "0.3.0"  # "Sleipner"
 edition = "2024"
 description = "Pure Rust parallel bzip2 decompressor — SIMD block scanning, multi-core Burrows-Wheeler decode"
 license = "MIT OR Apache-2.0 AND bzip2-1.0.6"

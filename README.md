@@ -1,4 +1,4 @@
-# lbzip2-rs
+hmm # lbzip2-rs
 
 <p align="center">
   <img src="doc/media/znippys.png" alt="znippys" width="400"/>
@@ -30,7 +30,15 @@ OSM-to-GeoParquet pipeline.
 
 ## Performance
 
-### Decompression (lbunzip2 CLI vs C lbzip2)
+### Library (in-process, liechtenstein.osm.bz2 — 5.2 MB → 60 MB, 71 blocks)
+
+| Mode | Throughput | vs C libbz2 |
+|------|-----------|-------------|
+| C libbz2 (single-thread) | 107 MB/s | 1.0× |
+| lbzip2-rs single-thread | 143 MB/s | 1.3× |
+| lbzip2-rs parallel (12 threads) | 713 MB/s | 6.6× |
+
+### CLI (lbunzip2 vs C lbzip2)
 
 | Test file | C lbzip2 | lbzip2-rs | |
 |-----------|----------|-----------|---|

@@ -187,24 +187,25 @@ to 2020s hardware.
 | **Raw pointer output** | Branch prediction is deep but mispredicts are costly | Skip Vec bounds check per byte, `memset` for repeat runs |
 | **MTF fast paths** | Branch prediction loves hot paths | Special-case n=0 (no-op) and n=1 (swap) — the two most common indices |
 | **Group-of-50 inner loop** | Tight loops let the CPU speculate and prefetch better | Eliminate per-symbol counter check; fixed tree pointer for 50 symbols |
+| **Zero per-block heap allocs** | Allocator calls are serialized contention points | All Huffman tables, selectors, bitmaps live on the stack — only `tt` (pooled) and output (returned) allocate |
 
 ### Benchmark (liechtenstein.osm.bz2, 5.2 MB → 60 MB)
 
 | Mode | Throughput | vs C libbz2 |
 |---|---|---|
 | C libbz2 (single-thread) | 108 MB/s | 1.0× |
-| lbzip2-rs (single-thread) | 141 MB/s | 1.3× |
-| lbzip2-rs (parallel, 12 threads) | 704 MB/s | 6.5× |
+| lbzip2-rs (single-thread) | 143 MB/s | 1.3× |
+| lbzip2-rs (parallel, 12 threads) | 731 MB/s | 6.8× |
 
 ### Stage breakdown (single-thread, 71 blocks)
 
 | Stage | Time | % |
 |---|---|---|
 | Header + bitmap + selectors + trees | 3 ms | 0.8% |
-| Huffman decode + MTF + RLE1 | 105 ms | 26% |
+| Huffman decode + MTF + RLE1 | 98 ms | 25% |
 | Inverse BWT | 35 ms | 9% |
-| RLE2 + output | 260 ms | 64% |
-| **Total** | **403 ms** | |
+| RLE2 + output | 249 ms | 65% |
+| **Total** | **384 ms** | |
 
 The RLE2 stage dominates because the inverse BWT traversal is a dependent pointer
 chain through a 3.6 MB array — fundamentally memory-latency-bound. The 2-step

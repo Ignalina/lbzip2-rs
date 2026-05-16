@@ -11,8 +11,34 @@ use crate::bwt;
 use crate::huffman::HuffmanTree;
 use crate::mtf::MtfDecoder;
 
+use std::cell::RefCell;
+
 /// Maximum block size: 9 × 100,000 bytes.
 const MAX_BLOCKSIZE: usize = 900_000;
+
+thread_local! {
+    static TT_BUF: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Take a `tt` buffer from the thread-local pool, avoiding repeated heap allocation.
+fn take_tt_buffer(capacity: usize) -> Vec<u32> {
+    TT_BUF.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let mut buf = std::mem::take(&mut *slot);
+        buf.clear();
+        if buf.capacity() < capacity {
+            buf.reserve(capacity - buf.len());
+        }
+        buf
+    })
+}
+
+/// Return a `tt` buffer to the thread-local pool for reuse.
+fn return_tt_buffer(buf: Vec<u32>) {
+    TT_BUF.with(|cell| {
+        *cell.borrow_mut() = buf;
+    });
+}
 
 /// Error type for block decoding.
 #[derive(Debug)]
@@ -123,7 +149,7 @@ pub fn decode_block(reader: &mut BitReader<'_>, max_blocksize: u32) -> Result<Ve
     }
 
     // ── Huffman decode → MTF + RLE1 decode → tt array ─────────────────────
-    let mut tt: Vec<u32> = Vec::with_capacity(max_blocksize as usize);
+    let mut tt: Vec<u32> = take_tt_buffer(max_blocksize as usize);
     let mut c = [0u32; 256]; // byte frequency counts for BWT
 
     // Build MTF decoder with the actual used-byte alphabet.
@@ -205,8 +231,9 @@ pub fn decode_block(reader: &mut BitReader<'_>, max_blocksize: u32) -> Result<Ve
     let mut t_pos = bwt::inverse_bwt(&mut tt, orig_ptr, c);
 
     // ── RLE2 decode (bzip2 run-length post-processing) ────────────────────
-    let mut output = Vec::with_capacity(tt.len());
-    let mut last_byte: i16 = -1;
+    let mut output = Vec::with_capacity(tt.len() + tt.len() / 8);
+    let mut last_byte: u8 = 0;
+    let mut has_last = false;
     let mut byte_repeats: u8 = 0;
     let n = tt.len();
     let tt_ptr = tt.as_ptr();
@@ -216,26 +243,34 @@ pub fn decode_block(reader: &mut BitReader<'_>, max_blocksize: u32) -> Result<Ve
         let b = entry as u8;
         t_pos = entry >> 8;
 
+        // Prefetch next entry to hide memory latency in BWT pointer chain
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            std::arch::x86_64::_mm_prefetch(
+                tt_ptr.add(t_pos as usize) as *const i8,
+                std::arch::x86_64::_MM_HINT_T0,
+            );
+        }
+
         if byte_repeats == 3 {
             let count = b as usize;
-            let lb = last_byte as u8;
-            for _ in 0..count {
-                output.push(lb);
-            }
+            output.resize(output.len() + count, last_byte);
             byte_repeats = 0;
-            last_byte = -1;
+            has_last = false;
             continue;
         }
 
-        if last_byte == i16::from(b) {
+        if has_last && last_byte == b {
             byte_repeats += 1;
         } else {
             byte_repeats = 0;
         }
-        last_byte = i16::from(b);
+        last_byte = b;
+        has_last = true;
         output.push(b);
     }
 
+    return_tt_buffer(tt);
     Ok(output)
 }
 

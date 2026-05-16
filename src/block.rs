@@ -15,6 +15,8 @@ use std::cell::RefCell;
 
 /// Maximum block size: 9 × 100,000 bytes.
 const MAX_BLOCKSIZE: usize = 900_000;
+/// Maximum number of selectors (15-bit field, practical limit ~18001).
+const MAX_SELECTORS: usize = 18002;
 
 thread_local! {
     static TT_BUF: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
@@ -73,7 +75,8 @@ pub fn decode_block(reader: &mut BitReader<'_>, max_blocksize: u32) -> Result<Ve
         .ok_or(BlockError("orig_ptr truncated"))? as usize;
 
     // ── Symbol bitmap (which bytes appear in this block) ──────────────────
-    let mut used_bytes: Vec<u8> = Vec::new();
+    let mut used_bytes = [0u8; 256];
+    let mut n_used: usize = 0;
 
     // 16 range flags: each covers 16 byte values.
     let mut ranges_present = [false; 16];
@@ -86,16 +89,17 @@ pub fn decode_block(reader: &mut BitReader<'_>, max_blocksize: u32) -> Result<Ve
         if !present { continue; }
         for sub in 0..16u8 {
             if reader.read_bit().ok_or(BlockError("symbol bitmap truncated"))? {
-                used_bytes.push(range_idx as u8 * 16 + sub);
+                used_bytes[n_used] = range_idx as u8 * 16 + sub;
+                n_used += 1;
             }
         }
     }
 
-    if used_bytes.is_empty() {
+    if n_used == 0 {
         return Err(BlockError("no symbols in block"));
     }
 
-    let n_symbols = used_bytes.len() + 2; // +2 for RUNA, RUNB; EOB = n_symbols - 1
+    let n_symbols = n_used + 2; // +2 for RUNA, RUNB; EOB = n_symbols - 1
 
     // ── Huffman table selectors ───────────────────────────────────────────
     let n_groups = reader.read_u8(3)
@@ -106,10 +110,13 @@ pub fn decode_block(reader: &mut BitReader<'_>, max_blocksize: u32) -> Result<Ve
 
     let n_selectors = reader.read_u16(15)
         .ok_or(BlockError("selectors_used truncated"))? as usize;
+    if n_selectors > MAX_SELECTORS {
+        return Err(BlockError("too many selectors"));
+    }
 
-    let mut selectors = Vec::with_capacity(n_selectors);
+    let mut selectors = [0u8; MAX_SELECTORS];
     let mut sel_mtf = MtfDecoder::new();
-    for _ in 0..n_selectors {
+    for i in 0..n_selectors {
         let mut trees = 0u8;
         while reader.read_bit().ok_or(BlockError("selector bit truncated"))? {
             trees += 1;
@@ -117,17 +124,18 @@ pub fn decode_block(reader: &mut BitReader<'_>, max_blocksize: u32) -> Result<Ve
                 return Err(BlockError("selector tree index too large"));
             }
         }
-        selectors.push(sel_mtf.decode(trees));
+        selectors[i] = sel_mtf.decode(trees);
     }
 
     // ── Huffman code lengths → trees ──────────────────────────────────────
-    let mut trees: Vec<HuffmanTree> = Vec::with_capacity(n_groups as usize);
+    let mut trees = [const { HuffmanTree::empty() }; 6];
+    let mut n_trees: usize = 0;
     for _ in 0..n_groups {
         let mut length = reader.read_u8(5)
             .ok_or(BlockError("huffman start length truncated"))? as i32;
-        let mut lengths = Vec::with_capacity(n_symbols);
+        let mut lengths = [0u8; 258];
 
-        for _ in 0..n_symbols {
+        for j in 0..n_symbols {
             loop {
                 if length < 1 || length > 20 {
                     return Err(BlockError("huffman code length out of range"));
@@ -141,11 +149,12 @@ pub fn decode_block(reader: &mut BitReader<'_>, max_blocksize: u32) -> Result<Ve
                     length += 1;
                 }
             }
-            lengths.push(length as u8);
+            lengths[j] = length as u8;
         }
 
-        trees.push(HuffmanTree::from_lengths(&lengths)
-            .map_err(|_| BlockError("invalid huffman tree"))?);
+        trees[n_trees] = HuffmanTree::from_lengths(&lengths[..n_symbols])
+            .map_err(|_| BlockError("invalid huffman tree"))?;
+        n_trees += 1;
     }
 
     // ── Huffman decode → MTF + RLE1 decode → tt array ─────────────────────
@@ -154,13 +163,13 @@ pub fn decode_block(reader: &mut BitReader<'_>, max_blocksize: u32) -> Result<Ve
 
     // Build MTF decoder with the actual used-byte alphabet.
     let mut byte_symbols = [0u8; 256];
-    byte_symbols[..used_bytes.len()].copy_from_slice(&used_bytes);
+    byte_symbols[..n_used].copy_from_slice(&used_bytes[..n_used]);
     let mut mtf = MtfDecoder::with_symbols(byte_symbols);
 
     let mut sel_idx: usize = 0;
-    let mut current_tree = trees.get(
-        *selectors.first().ok_or(BlockError("no selectors"))? as usize
-    ).ok_or(BlockError("selector out of range"))?;
+    let mut current_tree = &trees[
+        selectors[0] as usize
+    ];
 
     let mut repeat: u32 = 0;
     let mut repeat_power: u32 = 0;
@@ -214,10 +223,14 @@ pub fn decode_block(reader: &mut BitReader<'_>, max_blocksize: u32) -> Result<Ve
 
         // Switch Huffman table for next group of 50 symbols.
         sel_idx += 1;
-        let sel = *selectors.get(sel_idx)
-            .ok_or(BlockError("ran out of selectors"))? as usize;
-        current_tree = trees.get(sel)
-            .ok_or(BlockError("selector out of range"))?;
+        if sel_idx >= n_selectors {
+            return Err(BlockError("ran out of selectors"));
+        }
+        let sel = selectors[sel_idx] as usize;
+        if sel >= n_trees {
+            return Err(BlockError("selector out of range"));
+        }
+        current_tree = &trees[sel];
     }
 
     if orig_ptr >= tt.len() {

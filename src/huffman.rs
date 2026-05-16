@@ -7,6 +7,8 @@
 
 /// Max bits for the fast lookup table. 10 keeps all 6 tables (12KB) in L1 cache.
 const FAST_BITS: u8 = 10;
+const FAST_TABLE_SIZE: usize = 1 << FAST_BITS;
+const MAX_TREE_NODES: usize = 512;
 
 /// Pack symbol (9 bits) and length (5 bits) into a u16 for cache density.
 /// Bits [15:7] = symbol, bits [4:0] = length. Length 0 means tree fallback.
@@ -26,91 +28,102 @@ fn unpack_len(entry: u16) -> u8 {
 }
 
 /// A Huffman decoding tree with fast table lookup.
+/// All storage is inline (no heap allocation).
 pub struct HuffmanTree {
     /// Fast lookup: indexed by the top FAST_BITS of the bitstream.
     /// Each entry is a packed u16: symbol (bits 15:5) | length (bits 4:0).
-    /// Length 0 means tree fallback required.
-    fast_table: Vec<u16>,
-    /// Slow path: flat node array.  Each node stores [left_child, right_child].
+    fast_table: [u16; FAST_TABLE_SIZE],
+    /// Slow path: flat node array. Each node stores [left_child, right_child].
     /// Positive values = index of child node.
     /// Negative values = -(symbol + 1), i.e. a leaf.
-    nodes: Vec<[i32; 2]>,
+    nodes: [[i32; 2]; MAX_TREE_NODES],
+    n_nodes: usize,
 }
 
 impl HuffmanTree {
+    /// Create an empty (zeroed) tree. Const so it can be used in array init.
+    pub const fn empty() -> Self {
+        Self {
+            fast_table: [0; FAST_TABLE_SIZE],
+            nodes: [[0; 2]; MAX_TREE_NODES],
+            n_nodes: 0,
+        }
+    }
+
     /// Build a Huffman tree from code lengths.
     ///
     /// `lengths[i]` is the bit-length of symbol `i`.  Lengths of 0 mean the
     /// symbol is unused.  bzip2 lengths are in range 1..=20.
     pub fn from_lengths(lengths: &[u8]) -> Result<Self, &'static str> {
-        // Assign canonical codes: sort by (length, symbol), assign incrementally.
-        let mut symbols: Vec<(u16, u8)> = lengths.iter()
-            .enumerate()
-            .filter(|(_, len)| **len > 0)
-            .map(|(sym, len)| (sym as u16, *len))
-            .collect();
+        let mut symbols = [(0u16, 0u8); 258];
+        let mut n_sym = 0usize;
+        for (i, &len) in lengths.iter().enumerate() {
+            if len > 0 {
+                symbols[n_sym] = (i as u16, len);
+                n_sym += 1;
+            }
+        }
 
-        if symbols.is_empty() {
+        if n_sym == 0 {
             return Err("no symbols");
         }
 
-        symbols.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
+        symbols[..n_sym].sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
 
-        let min_len = symbols[0].1;
-
-        // Build tree by inserting each symbol.
-        let mut nodes: Vec<[i32; 2]> = vec![[0, 0]]; // root at index 0
+        let mut tree = Self::empty();
+        tree.n_nodes = 1; // root at index 0
 
         let mut code: u32 = 0;
         let mut prev_len: u8 = symbols[0].1;
+        let mut code_entries = [(0u32, 0u8, 0u16); 258];
+        let mut n_entries = 0usize;
 
-        // Also collect (code, length, symbol) for fast table construction
-        let mut code_entries: Vec<(u32, u8, u16)> = Vec::with_capacity(symbols.len());
-
-        for &(sym, len) in &symbols {
+        for idx in 0..n_sym {
+            let (sym, len) = symbols[idx];
             code <<= len - prev_len;
             prev_len = len;
 
-            code_entries.push((code, len, sym));
+            code_entries[n_entries] = (code, len, sym);
+            n_entries += 1;
 
             // Walk the tree for `len` bits of `code`, creating nodes as needed.
             let mut node_idx: usize = 0;
             for bit_pos in (0..len).rev() {
                 let bit = ((code >> bit_pos) & 1) as usize;
-                let child = nodes[node_idx][bit];
+                let child = tree.nodes[node_idx][bit];
                 if child > 0 {
                     node_idx = child as usize;
                 } else if bit_pos > 0 {
-                    // Create internal node.
-                    let new_idx = nodes.len();
-                    nodes.push([0, 0]);
-                    nodes[node_idx][bit] = new_idx as i32;
+                    let new_idx = tree.n_nodes;
+                    if new_idx >= MAX_TREE_NODES {
+                        return Err("huffman tree too large");
+                    }
+                    tree.nodes[node_idx][bit] = new_idx as i32;
+                    tree.n_nodes = new_idx + 1;
                     node_idx = new_idx;
                 } else {
                     // Leaf.
-                    nodes[node_idx][bit] = -(sym as i32 + 1);
+                    tree.nodes[node_idx][bit] = -(sym as i32 + 1);
                 }
             }
 
             code += 1;
         }
 
-        // Build fast lookup table (packed u16 entries)
-        let table_size = 1usize << FAST_BITS;
-        let mut fast_table = vec![0u16; table_size];
-
-        for &(c, len, sym) in &code_entries {
+        // Build fast lookup table
+        for idx in 0..n_entries {
+            let (c, len, sym) = code_entries[idx];
             if len <= FAST_BITS {
                 let pad = FAST_BITS - len;
                 let base = (c as usize) << pad;
                 let entry = pack_entry(sym, len);
                 for suffix in 0..(1usize << pad) {
-                    fast_table[base | suffix] = entry;
+                    tree.fast_table[base | suffix] = entry;
                 }
             }
         }
 
-        Ok(Self { fast_table, nodes })
+        Ok(tree)
     }
 
     /// Decode one symbol using fast table lookup with tree fallback.

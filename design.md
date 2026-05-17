@@ -1,195 +1,219 @@
-al# lbzip2-rs Design
+# lbzip2-rs Design
 
-Pure Rust parallel bzip2 decompressor — library internals.
+Pure Rust parallel bzip2 decompressor — library + CLI.
+
+## CLI Pipeline (lbunzip2)
+
+Three threads, zero-copy ring buffer:
+
+```
+┌──────────┐    sync_channel     ┌──────────────┐    sync_channel     ┌──────────┐
+│  READER  │──(slot,len,last)──→ │  MAIN THREAD │──(Vec<u8> segs)──→ │  WRITER  │
+│  thread  │                     │ carry+decode  │                     │  thread  │
+└────┬─────┘                     └──────────────┘                     └──────────┘
+     ↑                                  │
+     └──── slot_return channel ─────────┘   (4 × 232 MB recycled buffers)
+```
+
+**Ring buffer**: 4 pre-allocated slots, each `[32 MB headroom | 200 MB chunk]`.
+Slots are never freed — recycled through `slot_return` channel.
+
+**Carry**: between chunks, the unconsumed tail (< 1 MB) is copied into the
+headroom area of the next slot. The 200 MB read data stays in place — never copied.
+
+**Per-chunk cycle**:
+1. Reader fills 200 MB slot from disk (~50-90ms NVMe)
+2. Main thread: carry into headroom → `decode_chunk_segments()` → recycle slot
+3. Segments sent individually to writer (no assembly memcpy)
+
+## Parallel Split + Decode
+
+### O(N) Boundary Finding
+
+Not a full scan. N×oversplit evenly-spaced positions, each forward-scans ~500 bytes
+for the next BLOCK_MAGIC, then 73-bit quick-verify. **Total: 3-5ms for 200 MB.**
+
+### Segment Decode
+
+Chunk split into ~255 segments at boundaries. Each decoded by one rayon thread.
+Within a segment: sequential bitstream walk (Huffman → MTF → BWT → RLE2).
+Oversplit 8× enables rayon work-stealing for load balance.
+
+## Block Decode
+
+```
+BitReader (64-bit buffer, bulk 8-byte refill)
+  → Header (CRC + orig_ptr + bitmap + selectors)
+  → Huffman (10-bit packed u16 lookup, 2KB/table, L1-resident)
+  → MTF (fast-path n=0, n=1)
+  → RLE1 (RUNA/RUNB) → tt[] array (~3.6 MB)
+  → Inverse BWT (in-place T-transformation)
+  → RLE2 (pointer chase with 2-step prefetch, raw pointer output)
+  → Vec<u8>
+```
+
+**Thread-local tt pool**: 3.6 MB buffer reused per thread, no alloc/free per block.
+**Zero heap allocs per block**: Huffman tables, selectors, bitmaps all on stack.
 
 ## bzip2 Stream Format
 
-A single bzip2 stream:
-
 ```
-[BZh9]  [BLOCK_MAGIC block_data]  [BLOCK_MAGIC block_data]  ...  [FINAL_MAGIC crc32] [pad]
-  4B         48 bits                    48 bits                      48 bits   32 bits  0-7 bits
+[BZh9]  [BLOCK_MAGIC block_data]...  [FINAL_MAGIC crc32] [pad]
 ```
 
-- **Stream header** (`BZhN`): 4 bytes. `N` = block size level (`1`–`9`), max block = N × 100,000 bytes.
-- **Block magic**: 48-bit `0x314159265359` (digits of π). Blocks are **bit-aligned**, not byte-aligned.
-- **Block data**: CRC32 (32 bits), randomised flag (1 bit), orig_ptr (24 bits), symbol bitmap,
-  Huffman tables, MTF-encoded symbols. Variable length.
-- **End-of-stream**: 48-bit `0x177245385090` + 32-bit stream CRC + padding to byte boundary.
+- Block magic: 48-bit `0x314159265359` (π digits), **bit-aligned** (not byte-aligned)
+- End-of-stream: 48-bit `0x177245385090` (√π digits) + CRC32 + byte-pad
 
 ### pbzip2 Concatenated Streams
 
-Files produced by `pbzip2` (parallel bzip2 compressor) are **not** a single stream.
-They are many independent bzip2 streams concatenated:
+Planet files are ~1.3M independent mini-streams concatenated (~120 KB each).
+FINAL_MAGIC appears every ~120 KB, not just at EOF. Segment decoders handle
+FINAL_MAGIC → skip CRC + pad + BZhN header → continue.
 
-```
-[BZh9][blocks...][FINAL_MAGIC][crc32][pad]  [BZh9][blocks...][FINAL_MAGIC][crc32][pad]  ...
-└──────── stream 1 ────────────────────┘    └──────── stream 2 ────────────────────┘
-```
+### False Positive Rejection
 
-A 147 GB planet OSM file has ~1.3 million mini-streams, each ~120 KB compressed.
-Each mini-stream has its own header, blocks, and end-of-stream marker.
-
-**Critical implication**: FINAL_MAGIC appears every ~120 KB, not just at EOF.
-A decoder that stops at the first FINAL_MAGIC will decompress only one mini-stream.
-
-When hitting FINAL_MAGIC during streaming decode:
-1. Read 32-bit stream CRC (skip it)
-2. Align to next byte boundary (0–7 padding bits)
-3. Read 4-byte `BZhN` header of the next stream
-4. Continue reading BLOCK_MAGIC + block data as normal
-
-### 48-bit Block Magic False Positives
-
-The 48-bit magic `0x314159265359` can match inside compressed data by coincidence.
-
-**Quick verification** (73 bits, ~10 bytes after magic):
-- CRC32 (32 bits) — any value
-- Randomised flag (1 bit) — must be 0
-- orig_ptr (24 bits) — must be < max_blocksize (900,000)
-- Symbol group bitmap (16 bits) — must be nonzero
-
-This rejects false positives almost instantly without a full block decode.
-
-## Parallel Block Decode
-
-### Split Boundaries
-
-Instead of scanning the entire chunk for all block magics (expensive),
-we calculate N evenly-spaced **nominal positions** and forward-scan from each:
-
-```
-|<─────────────────── 200 MB chunk ──────────────────────>|
-|    ↓ split 1    ↓ split 2    ↓ split 3    ...          |
-|    scan ~200KB  scan ~200KB  scan ~200KB                |
-```
-
-Each of N cores forward-scans for the next BLOCK_MAGIC, then quick-verifies
-the 73-bit header. All N-1 splits run simultaneously via rayon.
-
-Total scanning: N × ~200 KB ≈ ~3 MB for 16 cores = **~1.5%** of 200 MB.
-
-### Segment Streaming
-
-The chunk is divided into segments at the split boundaries.
-Each segment is decoded in parallel by one Rayon thread:
-
-```
-Segment 0: [first_block ──────── split_1)
-Segment 1: [split_1 ──────────── split_2)
-...
-Segment N: [split_N ──────────── EOF]
-```
-
-Within each segment, the thread **streams** through the bitstream:
-1. Decode block at the boundary
-2. Read next 48-bit magic
-3. If BLOCK_MAGIC → decode next block, repeat
-4. If FINAL_MAGIC → skip CRC + pad + BZhN header, continue (pbzip2 support)
-5. If end of segment → stop
-
-No scanning within segments — just follows the natural bzip2 bitstream.
-
-## Decode Pipeline
-
-```
-compressed &[u8]
-     │
-     ▼
- ┌────────────────────┐
- │  block_scan         │  64-bit sliding window, 16-way unrolled per 2-byte step
- │  split_boundaries   │  N parallel forward scans + 73-bit quick verify
- └────────┬───────────┘
-          │  Vec<BlockBoundary>
-          ▼
- ┌────────────────────┐
- │  rayon par_iter     │  N segments decoded concurrently
- │  BitReader          │  64-bit buffered, bulk 8-byte refill, zero-copy from &[u8]
- │  → Huffman (table)  │  10-bit packed lookup, tree fallback
- │  → MTF decode       │  fast-path n=0/n=1
- │  → inverse BWT      │
- │  → RLE2 (prefetch)  │  2-step lookahead, raw pointer output
- └────────┬───────────┘
-          │  Vec<Vec<u8>>  (ordered segments)
-          ▼
-    caller receives segments directly (no assembly memcpy)
-```
-
-## Optimizations
-
-- **BitReader**: 64-bit shift register with bulk 8-byte refill (single load vs byte-at-a-time loop)
-- **Huffman**: 10-bit packed `u16` lookup table (2 KB/table, all 6 fit L1), cold tree fallback for codes >10 bits
-- **MTF**: fast-path for n=0 (no-op return) and n=1 (swap), the two most common indices
-- **Decode loop**: group-of-50 inner loop — fixed tree pointer, no per-symbol counter check
-- **BWT pointer chase**: 2-step prefetch lookahead hides L3 latency on the 3.6 MB random-access `tt` array
-- **RLE2 output**: raw pointer writes (no Vec bounds check per byte), `memset` for repeat runs
-- **Thread-local tt buffers**: reuse the 3.6 MB `tt` Vec across blocks on the same thread (no alloc/free per block)
-- **Block scan**: 64-bit sliding window, 16-way unrolled per 2-byte step
-- **Split verification**: 73-bit header check, not full trial-decode
-- **Segment output**: `decode_chunk_segments()` returns Vec<Vec<u8>> — no single-thread assembly
+73-bit quick-verify after magic: randomised=0, orig_ptr < max_blocksize, bitmap ≠ 0.
 
 ## Module Map
 
 ```
 src/
-├── lib.rs           # Crate root, BLOCK_MAGIC/FINAL_MAGIC constants
-├── bitreader.rs     # Bit-level reader, 64-bit buffer, arbitrary bit offset start
-├── block.rs         # Single block decoder: Huffman, MTF, inverse BWT, RLE
-├── block_scan.rs    # 48-bit magic scanner, split_boundaries, quick verify
-├── chunk.rs         # ChunkDecoder: parallel segment decode, concatenated stream support
-├── bwt.rs           # Inverse Burrows-Wheeler transform
-├── huffman.rs       # Huffman tree decode
-├── mtf.rs           # Move-to-front decoder
-├── parallel.rs      # In-memory parallel approach (decompress_parallel)
-├── reader.rs        # Streaming/mmap reader interfaces
-└── stream.rs        # Single-stream sequential decoder
+├── lib.rs           # BLOCK_MAGIC/FINAL_MAGIC, dedicated rayon pool (LBZIP2_THREADS)
+├── bitreader.rs     # 64-bit buffered reader, arbitrary bit offset, peek/consume
+├── block.rs         # Single block: Huffman→MTF→BWT→RLE2, thread-local tt pool
+├── block_scan.rs    # 48-bit scanner, split_boundaries_parallel, quick_verify
+├── bwt.rs           # Inverse Burrows-Wheeler (in-place T-transformation)
+├── chunk.rs         # ChunkDecoder: parallel segment decode, pbzip2 support
+├── huffman.rs       # 10-bit packed lookup + tree fallback
+├── mtf.rs           # Move-to-front: fast n=0/n=1
+├── parallel.rs      # In-memory parallel (small files)
+├── reader.rs        # StreamingBz2Read + ParallelBz2Read (mmap)
+├── stream.rs        # Sequential decoder (reference path)
+└── bin/lbunzip2.rs  # CLI: 3-thread pipeline with ring buffer
 ```
 
-## Backlog / Wishes for bzip2-rs crate
+## Benchmarks
 
-Questions / wishes for the `bzip2-rs` crate author — API changes that
-would have made parallel decode possible without reimplementing the decoder:
+### Odin — Threadripper PRO 3975WX, 32 cores, 512 GB DDR4
 
-```
-1. pub fn decode_block(data: &[u8], bit_offset: usize, max_blocksize: u32)
-       -> Result<(Vec<u8>, usize), Error>
-   — Expose single-block decode from arbitrary bit offset.
-   — Return (decompressed_bytes, bits_consumed).
+**Liechtenstein** (5.2 MB → 60 MB, 71 blocks):
 
-2. Zero-copy input: accept &[u8] + bit_offset, not impl Write.
-   — For mmap / ring-buffer use cases, borrowing is essential.
+| Mode | Time | Throughput | vs C |
+|---|---|---|---|
+| C libbz2 (single-thread) | 870 ms | 69 MB/s | 1.0× |
+| lbzip2-rs (single-thread) | 564 ms | 107 MB/s | 1.5× |
+| lbzip2-rs (parallel, 32 threads) | 89 ms | 676 MB/s | 9.8× |
 
-3. Expose block boundary scanning or document the 48-bit bit-aligned
-   magic (0x314159265359) so callers can split the stream themselves.
+**Stage breakdown** (single-thread):
 
-4. Optional: fn decode_block_into(data: &[u8], bit_offset: usize,
-                                   out: &mut [u8]) -> Result<usize, Error>
-   — Write directly into caller-provided buffer.
-```
-
-Without (1) and (2), parallel decode requires reimplementing the full
-Huffman → MTF → BWT → RLE pipeline from scratch (which is what this crate does).
-
-## Performance: Adapting 1996 Algorithms to Modern Hardware
-
-The original bzip2 was written by Julian Seward in 1996 for CPUs where computation
-was the bottleneck and memory was fast relative to the clock. Modern hardware has
-inverted this: CPUs are wide and fast, but memory latency (100+ cycles to L3)
-dominates. The algorithm is identical — these optimizations adapt the *mechanics*
-to 2020s hardware.
-
-| Optimization | Hardware shift since '96 | What we changed |
+| Stage | Time | % |
 |---|---|---|
-| **Thread-local buffer pool** | RAM is cheap, cores are many | Reuse 3.6 MB `tt` buffers per thread instead of alloc/free per block |
-| **2-step prefetch lookahead** | L3 latency now 100+ cycles vs ~10 in '96 | Prefetch the BWT pointer chain 2 hops ahead — hide L3 latency |
-| **Packed Huffman tables** | L1 cache is precious (32–48 KB) | Pack entries into `u16`, shrink from 96 KB → 12 KB — all 6 tables fit L1 |
-| **64-bit bulk bitreader** | Registers are 64-bit | Load 8 bytes in one shot instead of byte-at-a-time loop |
-| **Raw pointer output** | Branch prediction is deep but mispredicts are costly | Skip Vec bounds check per byte, `memset` for repeat runs |
-| **MTF fast paths** | Branch prediction loves hot paths | Special-case n=0 (no-op) and n=1 (swap) — the two most common indices |
-| **Group-of-50 inner loop** | Tight loops let the CPU speculate and prefetch better | Eliminate per-symbol counter check; fixed tree pointer for 50 symbols |
-| **Zero per-block heap allocs** | Allocator calls are serialized contention points | All Huffman tables, selectors, bitmaps live on the stack — only `tt` (pooled) and output (returned) allocate |
+| Header + bitmap + selectors + trees | 4 ms | 0.7% |
+| Huffman decode + MTF + RLE1 | 129 ms | 22.7% |
+| Inverse BWT | 121 ms | 21.3% |
+| **RLE2 + output** | **314 ms** | **55.2%** |
+| **Total** | **568 ms** | |
 
-### Benchmark (liechtenstein.osm.bz2, 5.2 MB → 60 MB)
+RLE2 dominates: dependent pointer chain through ~3.6 MB random-access tt[].
+Memory-latency-bound. 2-step prefetch helps but cannot break the serial dependency.
+
+**Planet** (147 GB, 32 cores, per-chunk timing):
+
+| Phase | Time | Notes |
+|---|---|---|
+| Reader I/O | 50-90ms | NVMe |
+| split_boundaries_parallel | 3-5ms | Negligible |
+| Parallel decode (32 cores) | ~1000ms | 200 MB → ~1900 MB |
+| Send segments to writer | ~550ms | Vec<u8> through sync_channel |
+
+## Ideas from Claude — Streaming Worker Pool
+
+### The Problem: `par_iter().collect()` Is a Barrier
+
+Right now, rayon decodes all ~255 segments in parallel, but `.collect()` waits for
+**every** segment to finish before **any** result goes to the writer. Measured on
+odin (32 cores, planet_1g.bz2):
+
+| Oversplit | Segments | Efficiency | Decode Wall | Send | **Total** |
+|-----------|----------|------------|-------------|------|-----------|
+| 4 | 127 | 89-91% | 975-1068ms | 32-72ms | **5.6s** |
+| 8 (default) | 255 | 93-95% | 914-967ms | 47-66ms | **5.2s** |
+| 16 | 511 | 95-97% | 926-1007ms | 88-152ms | **5.7s** |
+| 32 | 1023 | 97-98% | 897-981ms | 141-185ms | **5.8s** |
+
+More oversplit → better efficiency (less tail-wait) but **send phase explodes**
+because more segments means more channel sends. The sweet spot is oversplit=8.
+
+The real issue: between decode finishing and the next decode starting, all 32
+cores sit idle during carry + send (~60-150ms). That's 6-15% of wall time with
+zero CPU. On htop you see 100% → 0% → 100% — the sawtooth.
+
+### The Idea: Stream Segments Out During Decode
+
+Instead of:
+```
+[=== all 32 cores decode 255 segments ===][--- send 255 results ---][=== next chunk ===]
+                                           ^ 32 cores idle here
+```
+
+Do this:
+```
+[=== 32 cores decode, finished segments flow to writer as they complete ===][=== next chunk ===]
+                                                                            ^ no gap
+```
+
+Each core finishes a segment → drops it into an **ordered output queue** →
+writer picks it up immediately. No barrier. Decode and send overlap completely.
+
+Implementation: replace `par_iter().collect()` with N persistent worker threads.
+Each worker loops: grab next segment index from an atomic counter → decode →
+put result into a slot array at that index → signal the drain thread.
+A drain thread walks the slot array in order, sending completed segments to
+the writer as soon as they're ready (wait only if segment i isn't done yet).
+
+The drain thread is basically: `for i in 0..n_segments { wait(slot[i]); send(slot[i]); }`.
+Like a reorder buffer in a CPU pipeline — results arrive out of order, leave in order.
+
+### What This Buys
+
+- **Zero idle gap** between chunks — send overlaps with decode
+- **Writer starts earlier** — first segment arrives after ~30ms instead of ~950ms
+- **Eliminates the collect() barrier** — fast segments don't wait for slow ones
+- **Natural backpressure** — if writer is slow, drain thread blocks, workers keep
+  decoding into remaining slots
+
+### What It Doesn't Change
+
+- Total CPU work per block is the same — this just removes idle gaps between chunks
+- Won't help much on 8-core laptop (already 90% utilization, small gaps)
+
+### Risk
+
+- Ordered output is critical — segments must reach the writer in order
+- More complex than rayon par_iter — but not rocket science, it's a reorder buffer
+- Need to handle the pre-allocated output buffer idea at the same time to avoid
+  255 × 7 MB mallocs per chunk (separate concern, but natural fit)
+
+## Performance Philosophy
+
+The bzip2 algorithm is from 1996 when computation was the bottleneck and memory
+was fast. Modern hardware inverted this. The algorithm is identical — the
+mechanics are adapted:
+
+| What | Why |
+|---|---|
+| Thread-local tt buffers | Avoid alloc/free contention across 32 cores |
+| 2-step BWT prefetch | Hide 100+ cycle L3 latency |
+| Packed u16 Huffman tables | All 6 tables (12 KB) fit L1 |
+| 64-bit bulk bitreader | One load vs byte-at-a-time |
+| Raw pointer RLE2 output | No bounds check per byte, memset for repeats |
+| Group-of-50 inner loop | Fixed tree pointer, no per-symbol branch |
+
+---
+
+## History
+
+### Earlier Benchmark Numbers (Loki — Ryzen 9 7900, 12 cores)
 
 | Mode | Throughput | vs C libbz2 |
 |---|---|---|
@@ -197,7 +221,7 @@ to 2020s hardware.
 | lbzip2-rs (single-thread) | 143 MB/s | 1.3× |
 | lbzip2-rs (parallel, 12 threads) | 731 MB/s | 6.8× |
 
-### Stage breakdown (single-thread, 71 blocks)
+Stage breakdown (Loki, single-thread):
 
 | Stage | Time | % |
 |---|---|---|
@@ -207,6 +231,14 @@ to 2020s hardware.
 | RLE2 + output | 249 ms | 65% |
 | **Total** | **384 ms** | |
 
-The RLE2 stage dominates because the inverse BWT traversal is a dependent pointer
-chain through a 3.6 MB array — fundamentally memory-latency-bound. The 2-step
-prefetch hides most of L3 latency but cannot eliminate the serial dependency.
+### Wishes for bzip2-rs Crate
+
+API changes that would have made parallel decode possible without
+reimplementing the decoder:
+
+1. `decode_block(data: &[u8], bit_offset, max_blocksize)` — single-block from arbitrary offset
+2. Zero-copy input: `&[u8]` + bit_offset, not `impl Write`
+3. Expose block boundary scanning or document the 48-bit magic
+4. `decode_block_into()` — write into caller buffer
+
+Without (1) and (2), parallel decode requires reimplementing the full pipeline.

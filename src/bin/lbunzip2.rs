@@ -3,17 +3,14 @@
 //! Usage: lbunzip2 <input.bz2> [output]
 //!   If output is omitted, strips .bz2 extension.
 //!
-//! Zero-copy pipeline with 4-slot ring buffer:
+//! Worker-pool pipeline with 6-slot ring buffer:
 //!
-//!   ┌──────────┐    ┌────────────┐    ┌──────────┐
-//!   │  Reader   │──→│   Decode   │──→│  Writer   │
-//!   │  thread   │    │   (main)   │    │  thread   │
-//!   └──────────┘    └────────────┘    └──────────┘
-//!        ↑                │
-//!        └── slot pool ───┘   (4 pre-allocated buffers recycled)
+//!   Reader ──→ Main (carry+split) ──→ 32 Workers ──→ Collector ──→ Writer
+//!     ↑                                                    │
+//!     └──────────── slot recycle ──────────────────────────┘
 //!
-//! Only the tiny carry (< 1 MB) is ever copied.
-//! The 200 MB raw read stays in-place — never copied.
+//! Main thread posts work immediately after splitting — no barrier.
+//! Workers flow freely across slots. Collector writes slots in order.
 
 use std::{
     fs::File,
@@ -24,10 +21,8 @@ use std::{
 
 const CHUNK_SIZE: usize = 200 * 1024 * 1024;
 const BUF_CAP: usize = 4 * 1024 * 1024;
-const RING_SLOTS: usize = 4;
+const RING_SLOTS: usize = 6;
 /// Headroom at the start of each slot for carry data.
-/// Max carry ≈ CHUNK_SIZE / n_threads (one undecoded segment).
-/// With 200 MB / 16 threads ≈ 12.5 MB, so 32 MB is safe.
 const CARRY_HEADROOM: usize = 32 * 1024 * 1024;
 const SLOT_SIZE: usize = CARRY_HEADROOM + CHUNK_SIZE;
 
@@ -45,6 +40,39 @@ fn read_chunk(reader: &mut impl Read, buf: &mut [u8]) -> usize {
         }
     }
     got
+}
+
+/// Work item sent to a worker thread.
+struct WorkItem {
+    chunk_id: u64,
+    segment_id: usize,
+    /// Raw pointer to the beginning of the slot data (carry + read data).
+    data_ptr: *const u8,
+    data_len: usize,
+    start_bit: u64,
+    end_bit: u64,
+    max_blocksize: u32,
+}
+
+// Safety: data_ptr points into a slot that stays alive until all workers
+// finish with this chunk_id (enforced by collector before recycling).
+unsafe impl Send for WorkItem {}
+
+/// Result from a worker.
+struct SegmentResult {
+    chunk_id: u64,
+    segment_id: usize,
+    output: Vec<u8>,
+}
+
+/// Tracks in-flight slot state for the collector.
+struct InFlightSlot {
+    chunk_id: u64,
+    slot: Vec<u8>,
+    decode_segments: usize,
+    results: Vec<Option<Vec<u8>>>,
+    done_count: usize,
+    is_last: bool,
 }
 
 fn main() {
@@ -70,19 +98,30 @@ fn main() {
     // Read bz2 header (4 bytes: "BZhN")
     let mut header = [0u8; 4];
     reader.read_exact(&mut header).expect("read bz2 header");
-    let decoder = lbzip2::chunk::ChunkDecoder::from_header(&header)
-        .expect("invalid bz2 header");
 
-    let cores = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
+    let bz2_level = header[3];
+    if &header[..2] != b"BZ" || header[2] != b'h' || !(b'1'..=b'9').contains(&bz2_level) {
+        eprintln!("invalid bzip2 header");
+        std::process::exit(1);
+    }
+    let max_blocksize = 100_000 * (bz2_level - b'0') as u32;
+
+    let n_workers: usize = std::env::var("LBZIP2_THREADS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+        });
 
     eprintln!(
-        "lbunzip2: {} ({} MB) → {}  [{} cores]",
+        "lbunzip2: {} ({} MB) → {}  [{} workers, {} slots]",
         input_path,
         in_size / (1024 * 1024),
         output_path,
-        cores,
+        n_workers,
+        RING_SLOTS,
     );
 
     let t0 = Instant::now();
@@ -95,42 +134,16 @@ fn main() {
             let out_file = File::create(&output_path).expect("create output");
             let mut w = BufWriter::with_capacity(BUF_CAP, out_file);
             let mut total = 0u64;
-            #[cfg(feature = "timing")]
-            let mut batch_bytes = 0u64;
-            #[cfg(feature = "timing")]
-            let mut batch_start = Instant::now();
             for chunk in write_rx {
-                let len = chunk.len() as u64;
-                total += len;
+                total += chunk.len() as u64;
                 w.write_all(&chunk).expect("write output");
-                #[cfg(feature = "timing")]
-                {
-                    batch_bytes += len;
-                    // report every ~500 MB written
-                    if batch_bytes >= 500 * 1024 * 1024 {
-                        let dt = batch_start.elapsed().as_secs_f64();
-                        eprintln!(
-                            "[timing] writer: {:.0} MB in {:.2}s = {:.0} MB/s",
-                            batch_bytes as f64 / (1024.0 * 1024.0),
-                            dt,
-                            batch_bytes as f64 / (1024.0 * 1024.0) / dt,
-                        );
-                        batch_bytes = 0;
-                        batch_start = Instant::now();
-                    }
-                }
             }
             w.flush().expect("flush output");
             total
         })
     };
 
-    // ── Slot pool: pre-allocated buffers recycled between reader and decoder
-    //
-    //  Slot layout:  [CARRY_HEADROOM][────── CHUNK_SIZE ──────]
-    //                 ↑ carry copied    ↑ reader fills here
-    //                   into headroom     (zero copy — stays in place)
-    //
+    // ── Slot pool ───────────────────────────────────────────────────
     let (slot_return_tx, slot_return_rx) = mpsc::sync_channel::<Vec<u8>>(RING_SLOTS);
     for _ in 0..RING_SLOTS {
         let mut slot = Vec::with_capacity(SLOT_SIZE);
@@ -138,40 +151,15 @@ fn main() {
         slot_return_tx.send(slot).unwrap();
     }
 
-    // ── Reader thread: reads into pre-allocated slots ───────────────
-    // Reads raw data into slot[CARRY_HEADROOM..], sends (slot, read_len, is_last).
+    // ── Reader thread ───────────────────────────────────────────────
     let (filled_tx, filled_rx) = mpsc::sync_channel::<(Vec<u8>, usize, bool)>(RING_SLOTS);
     let reader_handle = std::thread::spawn(move || {
-        #[cfg(feature = "timing")]
-        let mut chunk_n = 0u32;
         loop {
-            #[cfg(feature = "timing")]
-            let t_wait = Instant::now();
-
             let mut slot = match slot_return_rx.recv() {
                 Ok(s) => s,
                 Err(_) => break,
             };
-
-            #[cfg(feature = "timing")]
-            let wait_ms = t_wait.elapsed().as_secs_f64() * 1000.0;
-            #[cfg(feature = "timing")]
-            let t_read = Instant::now();
-
             let got = read_chunk(&mut reader, &mut slot[CARRY_HEADROOM..]);
-
-            #[cfg(feature = "timing")]
-            {
-                let read_ms = t_read.elapsed().as_secs_f64() * 1000.0;
-                let read_mb = got as f64 / (1024.0 * 1024.0);
-                let mbps = if read_ms > 0.0 { read_mb / (read_ms / 1000.0) } else { 0.0 };
-                eprintln!(
-                    "[timing] reader chunk {}: wait={:.0}ms  read={:.0}ms ({:.0} MB, {:.0} MB/s)",
-                    chunk_n, wait_ms, read_ms, read_mb, mbps,
-                );
-                chunk_n += 1;
-            }
-
             let is_last = got < CHUNK_SIZE;
             if filled_tx.send((slot, got, is_last)).is_err() {
                 break;
@@ -182,19 +170,135 @@ fn main() {
         }
     });
 
-    // ── Main thread: zero-copy carry + parallel decode ──────────────
-    // Carry: the unconsumed tail from the previous chunk. Always small
-    // (< 1 MB). Copied into the headroom area of the next slot so
-    // decode_chunk sees one contiguous &[u8] without copying the 200 MB.
+    // ── Worker threads ──────────────────────────────────────────────
+    let (work_tx, work_rx) = mpsc::sync_channel::<WorkItem>(n_workers * 2);
+    let (result_tx, result_rx) = mpsc::sync_channel::<SegmentResult>(n_workers * 2);
+
+    // Wrap work_rx in Arc<Mutex> so multiple workers can recv from it.
+    let work_rx = std::sync::Arc::new(std::sync::Mutex::new(work_rx));
+
+    let mut worker_handles = Vec::with_capacity(n_workers);
+    for worker_id in 0..n_workers {
+        let work_rx = work_rx.clone();
+        let result_tx = result_tx.clone();
+        worker_handles.push(
+            std::thread::Builder::new()
+                .name(format!("lbzip2-w{worker_id}"))
+                .spawn(move || {
+                    loop {
+                        let item = {
+                            let rx = work_rx.lock().unwrap();
+                            match rx.recv() {
+                                Ok(item) => item,
+                                Err(_) => break, // channel closed
+                            }
+                        };
+
+                        // Safety: data_ptr is valid — slot not recycled until
+                        // collector sees all segments done for this chunk_id.
+                        let data = unsafe {
+                            std::slice::from_raw_parts(item.data_ptr, item.data_len)
+                        };
+
+                        let output = lbzip2::chunk::decode_segment(
+                            data,
+                            item.start_bit,
+                            item.end_bit,
+                            item.max_blocksize,
+                        );
+
+                        let _ = result_tx.send(SegmentResult {
+                            chunk_id: item.chunk_id,
+                            segment_id: item.segment_id,
+                            output,
+                        });
+                    }
+                })
+                .expect("spawn worker"),
+        );
+    }
+    // Drop our copy so workers' recv will get Err when work_tx is dropped.
+    drop(work_rx);
+    drop(result_tx);
+
+    // ── Collector thread ────────────────────────────────────────────
+    // Receives segment results, assembles per-slot, sends to writer
+    // in slot order, recycles slots.
+    let slot_return_for_collector = slot_return_tx.clone();
+    let (inflight_tx, inflight_rx) = mpsc::channel::<InFlightSlot>();
+
+    let collector_handle = std::thread::spawn(move || {
+        // Slots awaiting completion, keyed by chunk_id.
+        let mut in_flight: Vec<InFlightSlot> = Vec::new();
+        let mut next_write_id: u64 = 0;
+
+        // We need to receive from both inflight_rx (new slots) and result_rx (segment results).
+        // Use a simple polling approach since we don't have select!.
+        loop {
+            let mut did_work = false;
+
+            // Drain new in-flight slot registrations.
+            while let Ok(slot_info) = inflight_rx.try_recv() {
+                in_flight.push(slot_info);
+                did_work = true;
+            }
+
+            // Drain segment results.
+            // Block briefly if nothing else to do.
+            let result = if !did_work {
+                // Block on result_rx to avoid busy-loop, but with timeout
+                // so we can check inflight_rx periodically.
+                match result_rx.recv_timeout(std::time::Duration::from_millis(10)) {
+                    Ok(r) => Some(r),
+                    Err(mpsc::RecvTimeoutError::Timeout) => None,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        // Workers done. Drain remaining results.
+                        while let Ok(r) = result_rx.try_recv() {
+                            apply_result(&mut in_flight, r);
+                        }
+                        // Flush remaining completed slots.
+                        flush_completed(
+                            &mut in_flight, &mut next_write_id,
+                            &write_tx, &slot_return_for_collector,
+                        );
+                        break;
+                    }
+                }
+            } else {
+                result_rx.try_recv().ok()
+            };
+
+            if let Some(r) = result {
+                apply_result(&mut in_flight, r);
+                did_work = true;
+            }
+
+            // Drain any more results available without blocking.
+            while let Ok(r) = result_rx.try_recv() {
+                apply_result(&mut in_flight, r);
+                did_work = true;
+            }
+
+            // Try to flush completed slots to writer in order.
+            if did_work {
+                flush_completed(
+                    &mut in_flight, &mut next_write_id,
+                    &write_tx, &slot_return_for_collector,
+                );
+            }
+        }
+    });
+
+    // ── Main thread: carry + split + post work ──────────────────────
     let mut carry: Vec<u8> = header.to_vec();
-    #[cfg(feature = "timing")]
-    let mut chunk_n = 0u32;
+    let mut chunk_id: u64 = 0;
     #[cfg(feature = "timing")]
     let mut t_recv_start = Instant::now();
 
     for (mut slot, read_len, is_last) in filled_rx {
         #[cfg(feature = "timing")]
         let recv_wait_ms = t_recv_start.elapsed().as_secs_f64() * 1000.0;
+
         if read_len == 0 && carry.len() <= 4 {
             slot_return_tx.send(slot).ok();
             break;
@@ -203,73 +307,110 @@ fn main() {
         #[cfg(feature = "timing")]
         let t_carry = Instant::now();
 
-        // Copy tiny carry into headroom just before the read data.
+        // Copy tiny carry into headroom.
         let carry_len = carry.len();
         assert!(carry_len <= CARRY_HEADROOM, "carry {} > headroom {}", carry_len, CARRY_HEADROOM);
         let data_start = CARRY_HEADROOM - carry_len;
         slot[data_start..CARRY_HEADROOM].copy_from_slice(&carry);
         let data_end = CARRY_HEADROOM + read_len;
 
-        let data = &slot[data_start..data_end];
-
         #[cfg(feature = "timing")]
         let carry_ms = t_carry.elapsed().as_secs_f64() * 1000.0;
         #[cfg(feature = "timing")]
-        let t_decode = Instant::now();
+        let t_split = Instant::now();
 
-        // Parallel decode → segments returned separately (no big memcpy).
-        let (segments, consumed) = decoder
-            .decode_chunk_segments(data, is_last)
-            .expect("bz2 decode error");
-
-        #[cfg(feature = "timing")]
-        let decode_ms = t_decode.elapsed().as_secs_f64() * 1000.0;
-
-        // Save new carry (tiny — just the unconsumed tail).
-        carry.clear();
-        carry.extend_from_slice(&data[consumed..]);
-
-        // Recycle slot back to reader — no allocation.
-        slot_return_tx.send(slot).ok();
-
-        #[cfg(feature = "timing")]
-        let t_send = Instant::now();
-
-        let mut seg_bytes = 0usize;
-        // Send each segment to writer individually — no single-thread
-        // assembly of a giant Vec.  Writer writes them in order.
-        for seg in segments {
-            if !seg.is_empty() {
-                seg_bytes += seg.len();
-                write_tx.send(seg).expect("send to writer");
+        // Split into segment boundaries.
+        let data = &slot[data_start..data_end];
+        let split = match lbzip2::chunk::split_chunk(data, n_workers, max_blocksize, is_last) {
+            Some(s) => s,
+            None => {
+                slot_return_tx.send(slot).ok();
+                if is_last { break; }
+                continue;
             }
+        };
+
+        #[cfg(feature = "timing")]
+        let split_ms = t_split.elapsed().as_secs_f64() * 1000.0;
+
+        // Compute carry immediately — no need to wait for decode.
+        carry.clear();
+        carry.extend_from_slice(&data[split.consumed..]);
+
+        let total_bits = data.len() as u64 * 8;
+        let decode_segments = split.decode_segments;
+        let n_segments = split.segment_starts.len();
+
+        let segment_end = |i: usize| -> u64 {
+            if i + 1 < n_segments {
+                split.segment_starts[i + 1].bit_offset
+            } else {
+                total_bits
+            }
+        };
+
+        // Register in-flight slot with collector.
+        let inflight = InFlightSlot {
+            chunk_id,
+            slot,
+            decode_segments,
+            results: (0..decode_segments).map(|_| None).collect(),
+            done_count: 0,
+            is_last,
+        };
+
+        // Get pointer to data BEFORE moving slot into inflight.
+        // Safety: the slot lives inside InFlightSlot until collector recycles it,
+        // which only happens after all segments are done.
+        let data_ptr = inflight.slot[data_start..].as_ptr();
+        let data_len = data_end - data_start;
+
+        inflight_tx.send(inflight).expect("send inflight");
+
+        // Post work items for all segments.
+        for i in 0..decode_segments {
+            let start_bit = split.segment_starts[i].bit_offset;
+            let end_bit = segment_end(i);
+
+            work_tx.send(WorkItem {
+                chunk_id,
+                segment_id: i,
+                data_ptr,
+                data_len,
+                start_bit,
+                end_bit,
+                max_blocksize,
+            }).expect("send work");
         }
 
         #[cfg(feature = "timing")]
         {
-            let send_ms = t_send.elapsed().as_secs_f64() * 1000.0;
-            let in_mb = (read_len + carry_len) as f64 / (1024.0 * 1024.0);
-            let out_mb = seg_bytes as f64 / (1024.0 * 1024.0);
-            let decode_mbps = if decode_ms > 0.0 { out_mb / (decode_ms / 1000.0) } else { 0.0 };
             eprintln!(
-                "[timing] decode chunk {}: recv_wait={:.0}ms  carry={:.1}ms ({:.1}MB)  decode={:.0}ms ({:.0}MB in, {:.0}MB out, {:.0} MB/s)  send={:.1}ms",
-                chunk_n, recv_wait_ms, carry_ms, carry_len as f64 / (1024.0 * 1024.0),
-                decode_ms, in_mb, out_mb, decode_mbps,
-                send_ms,
+                "[timing] chunk {}: recv_wait={:.0}ms  carry={:.1}ms  split={:.1}ms  segments={}  posted_work={}",
+                chunk_id, recv_wait_ms, carry_ms, split_ms, n_segments, decode_segments,
             );
-            chunk_n += 1;
             t_recv_start = Instant::now();
         }
+
+        chunk_id += 1;
 
         if is_last {
             break;
         }
     }
 
-    drop(write_tx);
+    // Signal workers to stop (write_tx moved into collector — dropped when collector exits).
+    drop(work_tx);
+    drop(inflight_tx);
     drop(slot_return_tx);
-    reader_handle.join().expect("reader thread panicked");
-    let total_out = writer_handle.join().expect("writer thread panicked");
+
+    // Wait for pipeline to drain.
+    for h in worker_handles {
+        h.join().expect("worker panicked");
+    }
+    collector_handle.join().expect("collector panicked");
+    reader_handle.join().expect("reader panicked");
+    let total_out = writer_handle.join().expect("writer panicked");
 
     let elapsed = t0.elapsed().as_secs_f64();
     let out_mb = total_out / (1024 * 1024);
@@ -282,4 +423,50 @@ fn main() {
         out_mb,
         out_mb as f64 / elapsed,
     );
+}
+
+// Collector helper functions.
+
+fn apply_result(in_flight: &mut [InFlightSlot], result: SegmentResult) {
+    for slot in in_flight.iter_mut() {
+        if slot.chunk_id == result.chunk_id {
+            slot.results[result.segment_id] = Some(result.output);
+            slot.done_count += 1;
+            return;
+        }
+    }
+}
+
+fn flush_completed(
+    in_flight: &mut Vec<InFlightSlot>,
+    next_write_id: &mut u64,
+    write_tx: &mpsc::SyncSender<Vec<u8>>,
+    slot_return: &mpsc::SyncSender<Vec<u8>>,
+) {
+    loop {
+        let idx = in_flight.iter().position(|s| s.chunk_id == *next_write_id);
+        let idx = match idx {
+            Some(i) => i,
+            None => break,
+        };
+        if in_flight[idx].done_count < in_flight[idx].decode_segments {
+            break; // not complete yet
+        }
+
+        let mut completed = in_flight.remove(idx);
+
+        // Send segments to writer in order.
+        for seg in completed.results.drain(..) {
+            if let Some(data) = seg {
+                if !data.is_empty() {
+                    write_tx.send(data).expect("send to writer");
+                }
+            }
+        }
+
+        // Recycle slot buffer back to reader.
+        slot_return.send(completed.slot).ok();
+
+        *next_write_id += 1;
+    }
 }

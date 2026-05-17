@@ -54,13 +54,12 @@ impl std::fmt::Display for BlockError {
 
 impl std::error::Error for BlockError {}
 
-/// Decode one bzip2 block.
-///
-/// `reader` must be positioned right after the 48-bit block magic.
-/// `max_blocksize` comes from the stream header (100_000 × blocksize_level).
-///
-/// Returns the fully decompressed block data.
-pub fn decode_block(reader: &mut BitReader<'_>, max_blocksize: u32) -> Result<Vec<u8>, BlockError> {
+/// Decode header + Huffman + MTF + RLE1 → inverse BWT, returning (tt, t_pos).
+/// Shared logic for both `decode_block` and `decode_block_into`.
+fn decode_block_common(
+    reader: &mut BitReader<'_>,
+    max_blocksize: u32,
+) -> Result<(Vec<u32>, u32), BlockError> {
     // ── Block header ──────────────────────────────────────────────────────
     let _crc = reader.read_u32(32)
         .ok_or(BlockError("block CRC truncated"))?;
@@ -238,11 +237,14 @@ pub fn decode_block(reader: &mut BitReader<'_>, max_blocksize: u32) -> Result<Ve
     }
 
     // ── Inverse BWT ───────────────────────────────────────────────────────
-    let mut t_pos = bwt::inverse_bwt(&mut tt, orig_ptr, c);
+    let t_pos = bwt::inverse_bwt(&mut tt, orig_ptr, c);
 
-    // ── RLE2 decode (bzip2 run-length post-processing) ────────────────────
-    // Pre-allocate generously: n bytes for 1-per-iteration + headroom for repeats.
-    // Use raw pointer writes to skip Vec::push bounds check on every byte.
+    Ok((tt, t_pos))
+}
+
+/// RLE2 decode from tt[] into a newly allocated Vec<u8>.
+/// Uses raw pointer writes and 2-step prefetch — DO NOT CHANGE.
+fn rle2_decode_alloc(tt: &[u32], mut t_pos: u32) -> Vec<u8> {
     let n = tt.len();
     let out_cap = n + n / 4;
     let mut output = Vec::<u8>::with_capacity(out_cap);
@@ -257,8 +259,6 @@ pub fn decode_block(reader: &mut BitReader<'_>, max_blocksize: u32) -> Result<Ve
         let b = entry as u8;
         t_pos = entry >> 8;
 
-        // Two-step prefetch: read next entry (should be L1 from previous prefetch)
-        // and prefetch the entry *after* that, giving L3 two iterations to respond.
         let next_entry = unsafe { *tt_ptr.add(t_pos as usize) };
         #[cfg(target_arch = "x86_64")]
         unsafe {
@@ -270,7 +270,6 @@ pub fn decode_block(reader: &mut BitReader<'_>, max_blocksize: u32) -> Result<Ve
 
         if byte_repeats == 3 {
             let count = b as usize;
-            // Grow if repeat expansion would exceed capacity
             if out_len + count > output.capacity() {
                 unsafe { output.set_len(out_len); }
                 output.reserve(count);
@@ -291,14 +290,92 @@ pub fn decode_block(reader: &mut BitReader<'_>, max_blocksize: u32) -> Result<Ve
         }
         last_byte = b;
         has_last = true;
-        // Direct write — capacity guaranteed: out_len ≤ iteration count ≤ n < out_cap
         unsafe { *output.as_mut_ptr().add(out_len) = b; }
         out_len += 1;
     }
 
     unsafe { output.set_len(out_len); }
+    output
+}
+
+/// RLE2 decode from tt[] into a caller-provided buffer.
+/// Returns bytes written. Panics if buffer is too small.
+/// Same prefetch logic as rle2_decode_alloc — DO NOT CHANGE.
+fn rle2_decode_into(tt: &[u32], mut t_pos: u32, out: &mut [u8]) -> usize {
+    let n = tt.len();
+    let out_cap = out.len();
+    let mut out_len: usize = 0;
+    let mut last_byte: u8 = 0;
+    let mut has_last = false;
+    let mut byte_repeats: u8 = 0;
+    let tt_ptr = tt.as_ptr();
+    let out_ptr = out.as_mut_ptr();
+
+    for _ in 0..n {
+        let entry = unsafe { *tt_ptr.add(t_pos as usize) };
+        let b = entry as u8;
+        t_pos = entry >> 8;
+
+        let next_entry = unsafe { *tt_ptr.add(t_pos as usize) };
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            std::arch::x86_64::_mm_prefetch(
+                tt_ptr.add((next_entry >> 8) as usize) as *const i8,
+                std::arch::x86_64::_MM_HINT_T0,
+            );
+        }
+
+        if byte_repeats == 3 {
+            let count = b as usize;
+            assert!(out_len + count <= out_cap, "output buffer overflow in RLE2 repeat");
+            unsafe {
+                std::ptr::write_bytes(out_ptr.add(out_len), last_byte, count);
+            }
+            out_len += count;
+            byte_repeats = 0;
+            has_last = false;
+            continue;
+        }
+
+        if has_last && last_byte == b {
+            byte_repeats += 1;
+        } else {
+            byte_repeats = 0;
+        }
+        last_byte = b;
+        has_last = true;
+        assert!(out_len < out_cap, "output buffer overflow in RLE2");
+        unsafe { *out_ptr.add(out_len) = b; }
+        out_len += 1;
+    }
+
+    out_len
+}
+
+/// Decode one bzip2 block.
+///
+/// `reader` must be positioned right after the 48-bit block magic.
+/// `max_blocksize` comes from the stream header (100_000 × blocksize_level).
+///
+/// Returns the fully decompressed block data.
+pub fn decode_block(reader: &mut BitReader<'_>, max_blocksize: u32) -> Result<Vec<u8>, BlockError> {
+    let (tt, t_pos) = decode_block_common(reader, max_blocksize)?;
+    let output = rle2_decode_alloc(&tt, t_pos);
     return_tt_buffer(tt);
     Ok(output)
+}
+
+/// Decode one bzip2 block into a caller-provided buffer.
+///
+/// `reader` must be positioned right after the 48-bit block magic.
+/// `out` must be large enough for the decompressed data (max_blocksize + 25% is safe).
+///
+/// Returns bytes written to `out`.
+pub fn decode_block_into(reader: &mut BitReader<'_>, max_blocksize: u32, out: &mut [u8]) -> Result<usize, BlockError> {
+    let (tt, t_pos) = decode_block_common(reader, max_blocksize)?;
+    let written = rle2_decode_into(&tt, t_pos, out);
+    return_tt_buffer(tt);
+    Ok(written)
 }
 
 #[cfg(test)]

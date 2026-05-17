@@ -18,6 +18,120 @@ use crate::block::{self, BlockError};
 use crate::block_scan;
 use crate::{BLOCK_MAGIC, FINAL_MAGIC};
 
+/// Result of splitting a chunk into segment boundaries.
+pub struct ChunkSplit {
+    /// Segment start boundaries (one per segment found).
+    pub segment_starts: Vec<block_scan::BlockBoundary>,
+    /// Number of segments to decode (all if is_last, else n-1).
+    pub decode_segments: usize,
+    /// Bytes consumed from the data (for carry computation).
+    pub consumed: usize,
+}
+
+/// Split a chunk of compressed data into segment boundaries.
+///
+/// `n_segments` is typically n_cores (one segment per worker).
+/// Uses parallel scanning with rayon for speed.
+///
+/// Returns `None` if no block boundary found in data.
+pub fn split_chunk(
+    data: &[u8],
+    n_segments: usize,
+    max_blocksize: u32,
+    is_last: bool,
+) -> Option<ChunkSplit> {
+    let first_block = block_scan::find_next_block(data, 0)?;
+
+    let splits = crate::thread_pool().install(||
+        block_scan::split_boundaries_parallel(data, n_segments, max_blocksize)
+    );
+
+    let mut segment_starts = Vec::with_capacity(n_segments);
+    segment_starts.push(first_block);
+    for s in &splits {
+        if segment_starts.last().map_or(true, |prev: &block_scan::BlockBoundary| {
+            prev.bit_offset != s.bit_offset
+        }) {
+            segment_starts.push(*s);
+        }
+    }
+
+    let n = segment_starts.len();
+    let decode_segments = if is_last {
+        n
+    } else if n > 1 {
+        n - 1
+    } else {
+        return None;
+    };
+
+    let consumed = if decode_segments < n {
+        segment_starts[decode_segments].byte_offset()
+    } else {
+        data.len()
+    };
+
+    Some(ChunkSplit { segment_starts, decode_segments, consumed })
+}
+
+/// Decode a single segment of compressed bzip2 data.
+///
+/// Reads blocks from `start_bit` (after the 48-bit BLOCK_MAGIC) up to `end_bit`.
+/// Handles pbzip2 concatenated streams (FINAL_MAGIC boundaries).
+///
+/// Returns the decompressed output as a Vec<u8>.
+pub fn decode_segment(
+    data: &[u8],
+    start_bit: u64,
+    end_bit: u64,
+    max_blocksize: u32,
+) -> Vec<u8> {
+    let total_bits = data.len() as u64 * 8;
+    let mut output = Vec::new();
+
+    let mut reader = BitReader::from_bit_offset(data, (start_bit + 48) as usize);
+    let blk = match block::decode_block(&mut reader, max_blocksize) {
+        Ok(b) => b,
+        Err(_) => return output,
+    };
+    output.extend_from_slice(&blk);
+
+    loop {
+        let pos = reader.position() as u64;
+        if pos + 48 > total_bits || pos >= end_bit {
+            break;
+        }
+        let magic = match reader.read_u64(48) {
+            Some(v) => v,
+            None => break,
+        };
+        if magic == BLOCK_MAGIC {
+            match block::decode_block(&mut reader, max_blocksize) {
+                Ok(blk) => output.extend_from_slice(&blk),
+                Err(_) => break,
+            }
+        } else if magic == FINAL_MAGIC {
+            if reader.read_u32(32).is_none() { break; }
+            let p = reader.position();
+            let pad = (8 - (p % 8)) % 8;
+            if pad > 0 { BitReader::skip(&mut reader, pad); }
+            match reader.read_u32(32) {
+                Some(h) => {
+                    let b = h.to_be_bytes();
+                    if &b[..3] != b"BZh" {
+                        break;
+                    }
+                }
+                None => break,
+            }
+        } else {
+            break;
+        }
+    }
+
+    output
+}
+
 /// Stateful chunk decoder — holds bzip2 stream parameters.
 pub struct ChunkDecoder {
     max_blocksize: u32,
@@ -121,7 +235,10 @@ impl ChunkDecoder {
         };
 
         // ── Parallel decode — one thread per segment ────────────────────
-        let results: Vec<(Vec<u8>, u64, u64, f64)> = crate::thread_pool().install(|| {
+        #[cfg(feature = "timing")]
+        let t_par_wall = std::time::Instant::now();
+
+        let results: Vec<(Vec<u8>, u64, u64, f64, usize)> = crate::thread_pool().install(|| {
             (0..decode_segments)
             .into_par_iter()
             .map(|i| {
@@ -132,6 +249,7 @@ impl ChunkDecoder {
                 let end_bit = segment_end(i);
                 let comp_bits = end_bit.saturating_sub(segment_starts[i].bit_offset);
                 let mut output = Vec::new();
+                let mut n_blocks = 0usize;
 
                 let mut reader = BitReader::from_bit_offset(data, start_bit as usize);
                 let blk = match block::decode_block(&mut reader, max_bs) {
@@ -140,10 +258,11 @@ impl ChunkDecoder {
                         let _ms = 0.0f64;
                         #[cfg(feature = "timing")]
                         let _ms = t_seg.elapsed().as_secs_f64() * 1000.0;
-                        return (output, comp_bits, 0, _ms);
+                        return (output, comp_bits, 0, _ms, 0);
                     }
                 };
                 output.extend_from_slice(&blk);
+                n_blocks += 1;
 
                 loop {
                     let pos = reader.position() as u64;
@@ -156,7 +275,10 @@ impl ChunkDecoder {
                     };
                     if magic == BLOCK_MAGIC {
                         match block::decode_block(&mut reader, max_bs) {
-                            Ok(blk) => output.extend_from_slice(&blk),
+                            Ok(blk) => {
+                                output.extend_from_slice(&blk);
+                                n_blocks += 1;
+                            }
                             Err(_) => break,
                         }
                     } else if magic == FINAL_MAGIC {
@@ -182,7 +304,7 @@ impl ChunkDecoder {
                 let _ms = 0.0f64;
                 #[cfg(feature = "timing")]
                 let _ms = t_seg.elapsed().as_secs_f64() * 1000.0;
-                (output, comp_bits, out_len, _ms)
+                (output, comp_bits, out_len, _ms, n_blocks)
             })
             .collect()
         });
@@ -190,28 +312,68 @@ impl ChunkDecoder {
         #[cfg(feature = "timing")]
         {
             use std::io::Write;
+            let par_wall_ms = t_par_wall.elapsed().as_secs_f64() * 1000.0;
+
+            // Compute segment timing statistics
+            let seg_times: Vec<f64> = results.iter().map(|(_, _, _, ms, _)| *ms).collect();
+            let seg_blocks: Vec<usize> = results.iter().map(|(_, _, _, _, nb)| *nb).collect();
+            let max_seg = seg_times.iter().cloned().fold(0.0f64, f64::max);
+            let min_seg = seg_times.iter().cloned().fold(f64::MAX, f64::min);
+            let sum_seg: f64 = seg_times.iter().sum();
+            let mean_seg = sum_seg / seg_times.len() as f64;
+            let variance: f64 = seg_times.iter().map(|t| (t - mean_seg).powi(2)).sum::<f64>() / seg_times.len() as f64;
+            let stddev_seg = variance.sqrt();
+            let total_blocks: usize = seg_blocks.iter().sum();
+
+            // Barrier waste = wall time - max segment time (cores idle waiting)
+            let barrier_ms = par_wall_ms - max_seg;
+            // Theoretical perfect = sum / n_threads
+            let perfect_ms = sum_seg / n_threads as f64;
+            let efficiency = if par_wall_ms > 0.0 { (sum_seg / n_threads as f64) / par_wall_ms * 100.0 } else { 0.0 };
+
+            // Find outlier segments (>2× mean)
+            let outliers: Vec<(usize, f64, usize)> = seg_times.iter().enumerate()
+                .filter(|(_, t)| **t > mean_seg * 2.0)
+                .map(|(i, t)| (i, *t, seg_blocks[i]))
+                .collect();
+
+            static CHUNK_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let cid = CHUNK_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+            eprintln!(
+                "[timing] par_decode chunk {}: wall={:.0}ms  max_seg={:.0}ms  min_seg={:.0}ms  mean={:.0}ms  stddev={:.0}ms  barrier_waste={:.0}ms  perfect={:.0}ms  efficiency={:.0}%  segments={}  blocks={}",
+                cid, par_wall_ms, max_seg, min_seg, mean_seg, stddev_seg, barrier_ms, perfect_ms, efficiency, decode_segments, total_blocks,
+            );
+
+            if !outliers.is_empty() {
+                let outlier_str: Vec<String> = outliers.iter()
+                    .map(|(i, ms, nb)| format!("seg{}={:.0}ms({}blk)", i, ms, nb))
+                    .collect();
+                eprintln!("[timing]   outliers (>2x mean): {}", outlier_str.join(", "));
+            }
+
+            // CSV for detailed analysis
             static ONCE: std::sync::Once = std::sync::Once::new();
             static SEG_FILE: std::sync::Mutex<Option<std::fs::File>> = std::sync::Mutex::new(None);
             ONCE.call_once(|| {
                 let mut f = std::fs::File::create("/tmp/lbzip2_segments.csv").unwrap();
-                writeln!(f, "chunk,segment,comp_kb,decomp_kb,ms").unwrap();
+                writeln!(f, "chunk,segment,comp_kb,decomp_kb,ms,n_blocks").unwrap();
                 *SEG_FILE.lock().unwrap() = Some(f);
             });
-            static CHUNK_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            let cid = CHUNK_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if let Some(ref mut f) = *SEG_FILE.lock().unwrap() {
-                for (i, (_seg, comp_bits, decomp_bytes, ms)) in results.iter().enumerate() {
-                    writeln!(f, "{},{},{:.1},{:.1},{:.2}",
+                for (i, (_seg, comp_bits, decomp_bytes, ms, n_blocks)) in results.iter().enumerate() {
+                    writeln!(f, "{},{},{:.1},{:.1},{:.2},{}",
                         cid, i,
                         *comp_bits as f64 / 8.0 / 1024.0,
                         *decomp_bytes as f64 / 1024.0,
                         ms,
+                        n_blocks,
                     ).unwrap();
                 }
             }
         }
 
-        let segments: Vec<Vec<u8>> = results.into_iter().map(|(data, _, _, _)| data).collect();
+        let segments: Vec<Vec<u8>> = results.into_iter().map(|(data, _, _, _, _)| data).collect();
 
         let consumed = if decode_segments < n_segments {
             segment_starts[decode_segments].byte_offset()

@@ -4,8 +4,7 @@ hmm # lbzip2-rs
   <img src="doc/media/znippys.png" alt="znippys" width="400"/>
 </p>
 
-> 🧙‍♂ Med Allfaderns visdom, kompression och korruptionsskydd.
-> ⚡ Med hans blick över varje bit.
+> 🧙‍♂ Med Allfaderns visdm och blick över varje bit.
 
 Pure Rust parallel bzip2 decompressor. No C dependencies.
 Usable as a **library** (in-process, zero-copy) or as a **CLI** tool:

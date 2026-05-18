@@ -26,6 +26,38 @@ const RING_SLOTS: usize = 6;
 const CARRY_HEADROOM: usize = 32 * 1024 * 1024;
 const SLOT_SIZE: usize = CARRY_HEADROOM + CHUNK_SIZE;
 
+/// Detect physical (non-SMT) core count via Linux sysfs topology.
+/// Falls back to available_parallelism() on non-Linux or if sysfs is unavailable.
+fn physical_cores() -> Option<usize> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::collections::HashSet;
+        let mut ids = HashSet::new();
+        for entry in std::fs::read_dir("/sys/devices/system/cpu").ok()? {
+            let entry = entry.ok()?;
+            let name = entry.file_name();
+            let name = name.to_str()?;
+            if !name.starts_with("cpu") || !name[3..].chars().next()?.is_ascii_digit() {
+                continue;
+            }
+            let base = entry.path().join("topology");
+            let pkg = std::fs::read_to_string(base.join("physical_package_id"))
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok())
+                .unwrap_or(0);
+            if let Ok(s) = std::fs::read_to_string(base.join("core_id")) {
+                if let Ok(core) = s.trim().parse::<u32>() {
+                    ids.insert((pkg, core));
+                }
+            }
+        }
+        if !ids.is_empty() {
+            return Some(ids.len());
+        }
+    }
+    std::thread::available_parallelism().map(|n| n.get()).ok()
+}
+
 fn read_chunk(reader: &mut impl Read, buf: &mut [u8]) -> usize {
     let mut got = 0;
     while got < buf.len() {
@@ -63,6 +95,12 @@ struct SegmentResult {
     chunk_id: u64,
     segment_id: usize,
     output: Vec<u8>,
+}
+
+/// Messages to the collector — single channel, no polling.
+enum CollectorMsg {
+    NewSlot(InFlightSlot),
+    Result(SegmentResult),
 }
 
 /// Tracks in-flight slot state for the collector.
@@ -109,11 +147,7 @@ fn main() {
     let n_workers: usize = std::env::var("LBZIP2_THREADS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or_else(|| {
-            std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(4)
-        });
+        .unwrap_or_else(|| physical_cores().unwrap_or(4));
 
     eprintln!(
         "lbunzip2: {} ({} MB) → {}  [{} workers, {} slots]",
@@ -172,7 +206,7 @@ fn main() {
 
     // ── Worker threads ──────────────────────────────────────────────
     let (work_tx, work_rx) = mpsc::sync_channel::<WorkItem>(n_workers * 2);
-    let (result_tx, result_rx) = mpsc::sync_channel::<SegmentResult>(n_workers * 2);
+    let (collector_tx, collector_rx) = mpsc::sync_channel::<CollectorMsg>(n_workers * 4);
 
     // Wrap work_rx in Arc<Mutex> so multiple workers can recv from it.
     let work_rx = std::sync::Arc::new(std::sync::Mutex::new(work_rx));
@@ -180,7 +214,7 @@ fn main() {
     let mut worker_handles = Vec::with_capacity(n_workers);
     for worker_id in 0..n_workers {
         let work_rx = work_rx.clone();
-        let result_tx = result_tx.clone();
+        let collector_tx = collector_tx.clone();
         worker_handles.push(
             std::thread::Builder::new()
                 .name(format!("lbzip2-w{worker_id}"))
@@ -207,86 +241,53 @@ fn main() {
                             item.max_blocksize,
                         );
 
-                        let _ = result_tx.send(SegmentResult {
+                        let _ = collector_tx.send(CollectorMsg::Result(SegmentResult {
                             chunk_id: item.chunk_id,
                             segment_id: item.segment_id,
                             output,
-                        });
+                        }));
                     }
                 })
                 .expect("spawn worker"),
         );
     }
-    // Drop our copy so workers' recv will get Err when work_tx is dropped.
+    // Drop our copy so collector_rx will get Err when all senders are gone.
     drop(work_rx);
-    drop(result_tx);
+
+    // Main thread keeps a sender for NewSlot messages.
+    let inflight_tx = collector_tx.clone();
+    // Drop the extra clone — workers + main thread hold the only senders.
+    drop(collector_tx);
 
     // ── Collector thread ────────────────────────────────────────────
-    // Receives segment results, assembles per-slot, sends to writer
-    // in slot order, recycles slots.
+    // Single channel, pure blocking recv — no polling, no timeout.
     let slot_return_for_collector = slot_return_tx.clone();
-    let (inflight_tx, inflight_rx) = mpsc::channel::<InFlightSlot>();
 
     let collector_handle = std::thread::spawn(move || {
-        // Slots awaiting completion, keyed by chunk_id.
         let mut in_flight: Vec<InFlightSlot> = Vec::new();
         let mut next_write_id: u64 = 0;
 
-        // We need to receive from both inflight_rx (new slots) and result_rx (segment results).
-        // Use a simple polling approach since we don't have select!.
-        loop {
-            let mut did_work = false;
-
-            // Drain new in-flight slot registrations.
-            while let Ok(slot_info) = inflight_rx.try_recv() {
-                in_flight.push(slot_info);
-                did_work = true;
-            }
-
-            // Drain segment results.
-            // Block briefly if nothing else to do.
-            let result = if !did_work {
-                // Block on result_rx to avoid busy-loop, but with timeout
-                // so we can check inflight_rx periodically.
-                match result_rx.recv_timeout(std::time::Duration::from_millis(10)) {
-                    Ok(r) => Some(r),
-                    Err(mpsc::RecvTimeoutError::Timeout) => None,
-                    Err(mpsc::RecvTimeoutError::Disconnected) => {
-                        // Workers done. Drain remaining results.
-                        while let Ok(r) = result_rx.try_recv() {
-                            apply_result(&mut in_flight, r);
-                        }
-                        // Flush remaining completed slots.
-                        flush_completed(
-                            &mut in_flight, &mut next_write_id,
-                            &write_tx, &slot_return_for_collector,
-                        );
-                        break;
-                    }
+        while let Ok(msg) = collector_rx.recv() {
+            match msg {
+                CollectorMsg::NewSlot(slot_info) => {
+                    in_flight.push(slot_info);
                 }
-            } else {
-                result_rx.try_recv().ok()
-            };
-
-            if let Some(r) = result {
-                apply_result(&mut in_flight, r);
-                did_work = true;
+                CollectorMsg::Result(result) => {
+                    apply_result(&mut in_flight, result);
+                }
             }
-
-            // Drain any more results available without blocking.
-            while let Ok(r) = result_rx.try_recv() {
-                apply_result(&mut in_flight, r);
-                did_work = true;
-            }
-
-            // Try to flush completed slots to writer in order.
-            if did_work {
-                flush_completed(
-                    &mut in_flight, &mut next_write_id,
-                    &write_tx, &slot_return_for_collector,
-                );
-            }
+            // After every message, try to flush completed slots.
+            flush_completed(
+                &mut in_flight, &mut next_write_id,
+                &write_tx, &slot_return_for_collector,
+            );
         }
+
+        // Channel closed — flush any remaining.
+        flush_completed(
+            &mut in_flight, &mut next_write_id,
+            &write_tx, &slot_return_for_collector,
+        );
     });
 
     // ── Main thread: carry + split + post work ──────────────────────
@@ -365,7 +366,7 @@ fn main() {
         let data_ptr = inflight.slot[data_start..].as_ptr();
         let data_len = data_end - data_start;
 
-        inflight_tx.send(inflight).expect("send inflight");
+        inflight_tx.send(CollectorMsg::NewSlot(inflight)).expect("send inflight");
 
         // Post work items for all segments.
         for i in 0..decode_segments {

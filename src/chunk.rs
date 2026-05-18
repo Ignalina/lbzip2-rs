@@ -79,6 +79,9 @@ pub fn split_chunk(
 /// Reads blocks from `start_bit` (after the 48-bit BLOCK_MAGIC) up to `end_bit`.
 /// Handles pbzip2 concatenated streams (FINAL_MAGIC boundaries).
 ///
+/// Zero per-block allocation: decodes directly into the output buffer
+/// using `decode_block_into()`. Only the segment Vec grows (amortised).
+///
 /// Returns the decompressed output as a Vec<u8>.
 pub fn decode_segment(
     data: &[u8],
@@ -87,14 +90,15 @@ pub fn decode_segment(
     max_blocksize: u32,
 ) -> Vec<u8> {
     let total_bits = data.len() as u64 * 8;
+    // Max output per block: blocksize + 25% for RLE2 expansion.
+    let block_cap = max_blocksize as usize + max_blocksize as usize / 4;
     let mut output = Vec::new();
 
     let mut reader = BitReader::from_bit_offset(data, (start_bit + 48) as usize);
-    let blk = match block::decode_block(&mut reader, max_blocksize) {
-        Ok(b) => b,
+    match decode_block_into_vec(&mut output, &mut reader, max_blocksize, block_cap) {
+        Ok(_) => {}
         Err(_) => return output,
-    };
-    output.extend_from_slice(&blk);
+    }
 
     loop {
         let pos = reader.position() as u64;
@@ -106,9 +110,8 @@ pub fn decode_segment(
             None => break,
         };
         if magic == BLOCK_MAGIC {
-            match block::decode_block(&mut reader, max_blocksize) {
-                Ok(blk) => output.extend_from_slice(&blk),
-                Err(_) => break,
+            if decode_block_into_vec(&mut output, &mut reader, max_blocksize, block_cap).is_err() {
+                break;
             }
         } else if magic == FINAL_MAGIC {
             if reader.read_u32(32).is_none() { break; }
@@ -130,6 +133,31 @@ pub fn decode_segment(
     }
 
     output
+}
+
+/// Decode one block directly into the tail of `output`, avoiding a temporary Vec.
+#[inline]
+fn decode_block_into_vec(
+    output: &mut Vec<u8>,
+    reader: &mut BitReader<'_>,
+    max_blocksize: u32,
+    block_cap: usize,
+) -> Result<(), block::BlockError> {
+    output.reserve(block_cap);
+    let cur_len = output.len();
+    // Safety: we just reserved block_cap bytes; the spare capacity is valid
+    // uninitialised memory that decode_block_into will write into.
+    unsafe { output.set_len(cur_len + block_cap); }
+    match block::decode_block_into(reader, max_blocksize, &mut output[cur_len..]) {
+        Ok(written) => {
+            unsafe { output.set_len(cur_len + written); }
+            Ok(())
+        }
+        Err(e) => {
+            unsafe { output.set_len(cur_len); }
+            Err(e)
+        }
+    }
 }
 
 /// Stateful chunk decoder — holds bzip2 stream parameters.

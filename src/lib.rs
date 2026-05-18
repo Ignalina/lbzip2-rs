@@ -4,7 +4,7 @@
 //!   1 reader thread fills a ChunkRevolver ring buffer (~100 MB slots)
 //!   with raw compressed bzip2 data.
 //!
-//!   Per slot the reader does a cheap SIMD bit-scan to locate bzip2 block
+//!   Per slot the reader does a cheap bit-scan to locate bzip2 block
 //!   boundaries (magic 0x314159265359 at arbitrary bit offsets), then
 //!   dispatches N sub-ranges to a worker pool.
 //!

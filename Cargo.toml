@@ -2,7 +2,7 @@
 name = "lbzip2"
 version = "0.4.1"  # "Skadi"
 edition = "2024"
-description = "Pure Rust parallel bzip2 decompressor — SIMD block scanning, multi-core Burrows-Wheeler decode"
+description = "Pure Rust parallel bzip2 decompressor — fast block scanning, multi-core Burrows-Wheeler decode"
 license = "MIT OR Apache-2.0 AND bzip2-1.0.6"
 repository = "https://github.com/Ignalina/lbzip2-rs"
 homepage = "https://github.com/Ignalina/lbzip2-rs"

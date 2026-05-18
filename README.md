@@ -1,4 +1,4 @@
-hmm # lbzip2-rs  v0.4.0 "Skadi" ❄️
+# lbzip2-rs  v0.4.0 "Skadi" ❄️
 
 <p align="center">
   <img src="doc/media/znippys.png" alt="znippys" width="400"/>
@@ -37,6 +37,28 @@ Planet 1 GB slice (1023 MB compressed → 9861 MB decompressed), interleaved run
 Rust uses 12% less total CPU — the single-thread decode is 1.5× faster than C libbz2.
 On sustained workloads, thermal throttling on thin laptops can mask the advantage.
 
+### Odin — Threadripper PRO 3975WX, 32 cores, 512 GB DDR4
+
+Planet 1 GB slice (1023 MB compressed → 9861 MB decompressed), caches dropped, 20s cooldown:
+
+| Condition | Rust lbzip2-rs | C lbzip2 | Δ |
+|---|---:|---:|---|
+| **Cold start** (fair) | **5.1s (1941 MB/s)** | 5.1s (1924 MB/s) | **~even** |
+| **Warm** | **5.1s (1929 MB/s)** | 5.2s (1906 MB/s) | **Rust +1%** |
+| **CPU time** (total work) | **2m16s** | 2m33s | **Rust −11% CPU** |
+
+With 32 physical cores both implementations saturate the decode pipeline — wall time
+converges. Rust still uses 11% less total CPU thanks to the faster single-thread decode.
+
+Full planet (147 GB → 2.0 TB decompressed):
+
+| Metric | Rust lbzip2-rs | C lbzip2 | Δ |
+|---|---:|---:|---|
+| **Wall time** | **10m 52s** | 12m 29s | **Rust +13%** |
+| **Throughput** | **3104 MB/s** | 2703 MB/s | |
+| **CPU time** (user) | **326m** | 382m | **Rust −15% CPU** |
+| Output size | 2.0 TB | 2.0 TB | |
+
 ### Single-thread decode (library, no I/O)
 
 | Implementation | Time | Throughput | vs C bzip2 |
@@ -44,12 +66,6 @@ On sustained workloads, thermal throttling on thin laptops can mask the advantag
 | C bzip2 (libbz2 1.0.8) | 123.5s | 80 MB/s | 1.0× |
 | C lbzip2 -n1 | 96.0s | 103 MB/s | 1.3× |
 | **Rust lbzip2-rs** | **87.9s** | **112 MB/s** | **1.4×** |
-
-### Odin — Threadripper PRO 3975WX, 32 cores, 512 GB DDR4
-
-| Mode | Throughput | Notes |
-|------|-----------:|-------|
-| lbzip2-rs parallel (32 cores) | **1909 MB/s** | Worker pool, 5.2s for 1 GB |
 
 ### End-to-end: Planet bz2 → PBF (osm-katana)
 

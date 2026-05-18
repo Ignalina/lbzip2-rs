@@ -1,4 +1,4 @@
-//! SIMD-friendly bit-level scanner for bzip2 block boundaries.
+//! Bit-level scanner for bzip2 block boundaries.
 //!
 //! bzip2 blocks start with the 48-bit magic 0x314159265359 at arbitrary
 //! **bit** offsets (not byte-aligned).  We scan a 64-bit sliding window

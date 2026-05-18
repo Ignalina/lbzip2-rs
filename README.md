@@ -15,13 +15,7 @@ Usable as a **library** (in-process, zero-copy) or as a **CLI** tool:
 cargo run --release --bin lbunzip2 -- planet-241021.osm.bz2 > planet.osm
 ```
 
-**What makes this crate unique:** 100 % Rust (no C/FFI), in-process,
-zero-copy, *and* parallel block-boundary scanning — splitting a chunk
-across *N* cores is **O(N)**, not O(n) where *n* is the raw byte count
-(e.g. 200 MB per chunk). Each core only scans ~500 bytes forward from
-its split point, so with 16 cores the total scan is ~8 KB for a 200 MB
-chunk. 4× oversplit lets rayon work-steal across 64 segments, eliminating
-core idle time from uneven block sizes.
+**What makes this crate unique:** 100% Rust, zero-copy in-process library with a lightweight parallel split method that finds block boundaries with tiny forward-scans (~500 bytes per split). The decoder uses a streaming worker-pool (reorder buffer) to avoid global barriers and is tuned for modern CPU caches (packed Huffman tables fit L1, thread-local buffers leverage L2), yielding high throughput on many-core machines.
 
 Part of the [znippy](https://github.com/Ignalina) group of software,
 designed for fast zero-copy integration with
@@ -30,22 +24,23 @@ OSM-to-GeoParquet pipeline.
 
 ## Performance
 
-### Library (in-process, liechtenstein.osm.bz2 — 5.2 MB → 60 MB, 71 blocks)
+### Library (in-process — Planet 1 GB slice)
 
-| Mode | Throughput | vs C libbz2 |
-|------|-----------|-------------|
-| C libbz2 (single-thread) | 107 MB/s | 1.0× |
-| lbzip2-rs single-thread | 143 MB/s | 1.3× |
-| lbzip2-rs parallel (12 threads) | 713 MB/s | 6.6× |
+Measured on odin (Threadripper PRO 32 cores, 512 GB RAM) using /home/rickard/work/planet_1g.bz2 (1 GB compressed → ~9.86 GB decompressed):
 
-### CLI (lbunzip2 vs C lbzip2)
+| Mode | Throughput | Notes |
+|------|-----------:|-------|
+| lbzip2-rs parallel (32 threads) | 1799 MB/s | 1 GB → 9.86 GB in 5.5 s (measured)
 
-| Test file | C lbzip2 | lbzip2-rs | |
-|-----------|----------|-----------|---|
-| Planet 1 GB slice (→ 9.86 GB) | 30.5 s (323 MB/s) | **30.3 s (325 MB/s)** | **0.6% faster** |
-| Liechtenstein 3 MB (→ 60 MB) | 0.15 s | 0.22 s | startup overhead |
 
-8-core / 16-thread, NVMe, `/dev/null` output, 3-run average.
+### CLI (lbunzip2)
+
+| Test file | lbzip2-rs (measured) | Notes |
+|-----------|---------------------:|-------|
+| Planet 1 GB slice (→ 9.86 GB) | 5.5 s (1799 MB/s) | odin (32 cores), /home/rickard/work/planet_1g.bz2 → /dev/null
+| Liechtenstein 3 MB (→ 60 MB) | 0.22 s | startup overhead |
+
+Measured on odin (32 cores, NVMe). Use LBZIP2_THREADS to control worker count.
 
 ### End-to-end: Planet bz2 → PBF (osm-katana)
 

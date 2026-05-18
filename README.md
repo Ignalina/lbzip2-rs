@@ -1,4 +1,4 @@
-# lbzip2-rs  v0.4.0 "Skadi" ❄️
+# lbzip2-rs  v0.4.2 "Sleipner" 🐴
 
 <p align="center">
   <img src="doc/media/znippys.png" alt="znippys" width="400"/>

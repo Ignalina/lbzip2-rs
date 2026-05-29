@@ -84,8 +84,6 @@ pub fn find_all_blocks(buf: &[u8]) -> Vec<BlockBoundary> {
 /// Splits the buffer into `n_threads` chunks, scans each in parallel,
 /// then merges and deduplicates the results in bit-offset order.
 pub fn find_all_blocks_parallel(buf: &[u8], n_threads: usize) -> Vec<BlockBoundary> {
-    use rayon::prelude::*;
-
     let n = n_threads.max(1);
     if buf.len() < 16 || n == 1 {
         return find_all_blocks(buf);
@@ -93,10 +91,7 @@ pub fn find_all_blocks_parallel(buf: &[u8], n_threads: usize) -> Vec<BlockBounda
 
     let chunk_size = buf.len() / n;
 
-    let mut per_thread: Vec<Vec<BlockBoundary>> = crate::thread_pool().install(|| {
-        (0..n)
-        .into_par_iter()
-        .map(|i| {
+    let per_thread: Vec<Vec<BlockBoundary>> = crate::par::par_map(n, |i| {
             let start_byte = i * chunk_size;
             // Each chunk scans until the START of the next chunk + 8 bytes overlap
             // (so we don't miss a magic that spans the boundary)
@@ -120,10 +115,8 @@ pub fn find_all_blocks_parallel(buf: &[u8], n_threads: usize) -> Vec<BlockBounda
                 }
             }
             result
-        })
-        .collect()
     });
-    let mut all: Vec<BlockBoundary> = per_thread.drain(..).flatten().collect();
+    let mut all: Vec<BlockBoundary> = per_thread.into_iter().flatten().collect();
     all.sort_by_key(|b| b.bit_offset);
     all.dedup_by_key(|b| b.bit_offset);
     all
@@ -231,26 +224,20 @@ pub fn split_boundaries_parallel(
     n_splits: usize,
     max_blocksize: u32,
 ) -> Vec<BlockBoundary> {
-    use rayon::prelude::*;
-
     if n_splits <= 1 || buf.is_empty() {
         return Vec::new();
     }
 
     let total_bits = buf.len() as u64 * 8;
 
-    let mut boundaries: Vec<Option<BlockBoundary>> = crate::thread_pool().install(|| {
-        (1..n_splits)
-        .into_par_iter()
-        .map(|i| {
+    let boundaries: Vec<Option<BlockBoundary>> = crate::par::par_map(n_splits - 1, |idx| {
+            let i = idx + 1;
             let nominal_bit = total_bits * i as u64 / n_splits as u64;
             find_quick_boundary(buf, nominal_bit, max_blocksize)
-        })
-        .collect()
     });
 
     // Filter, sort, deduplicate
-    let mut result: Vec<BlockBoundary> = boundaries.drain(..).flatten().collect();
+    let mut result: Vec<BlockBoundary> = boundaries.into_iter().flatten().collect();
     result.sort_by_key(|b| b.bit_offset);
     result.dedup_by_key(|b| b.bit_offset);
     result

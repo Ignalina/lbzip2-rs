@@ -1,6 +1,6 @@
 [package]
 name = "lbzip2"
-version = "0.4.2"  # "Sleipner"
+version = "0.5.0"  # "Sleipner" — rayon-free (scoped-thread par_map)
 edition = "2024"
 description = "Pure Rust parallel bzip2 decompressor — fast block scanning, multi-core Burrows-Wheeler decode"
 license = "MIT OR Apache-2.0 AND bzip2-1.0.6"
@@ -15,7 +15,6 @@ categories = ["compression", "encoding"]
 timing = []
 
 [dependencies]
-rayon = "1"
 memchr = "2"
 
 [dev-dependencies]

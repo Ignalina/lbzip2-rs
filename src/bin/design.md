@@ -40,7 +40,7 @@ into `slot[HEADROOM..]`. Sends `(slot, read_len, is_last)` to decode.
 
 1. Receives filled slot
 2. Copies tiny carry into headroom (< 13 MB)
-3. Calls `decode_chunk_segments()` — parallel decode via rayon
+3. Calls `decode_chunk_segments()` — parallel decode via scoped-thread `par_map`
 4. Saves new carry (unconsumed tail)
 5. Recycles slot back to reader pool
 6. Sends each decoded segment to writer individually (no assembly memcpy)

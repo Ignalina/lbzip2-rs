@@ -9,8 +9,6 @@
 
 use std::io::{self, Read};
 
-use rayon::prelude::*;
-
 use crate::bitreader::BitReader;
 use crate::block::{self, BlockError};
 use crate::block_scan;
@@ -137,16 +135,13 @@ impl<R: Read> StreamingBz2Read<R> {
         let comp_data: &[u8] = &self.comp_buf;
         let max_bs = self.max_blocksize;
 
-        let results: Vec<Result<Vec<u8>, BlockError>> = crate::thread_pool().install(|| {
-            decode_boundaries
-            .par_iter()
-            .map(|boundary| {
+        let results: Vec<Result<Vec<u8>, BlockError>> =
+            crate::par::par_map(decode_boundaries.len(), |bi| {
+                let boundary = &decode_boundaries[bi];
                 let bit_after_magic = boundary.bit_offset + 48;
                 let mut reader = BitReader::from_bit_offset(comp_data, bit_after_magic as usize);
                 block::decode_block(&mut reader, max_bs)
-            })
-            .collect()
-        });
+            });
 
         // ── Assemble decompressed output ────────────────────────────────
         self.out_buf.clear();
@@ -258,17 +253,16 @@ impl<'a> ParallelBz2Read<'a> {
 
         let batch_end = self.next_block + remaining.min(BATCH_SIZE);
         let batch = &self.boundaries[self.next_block..batch_end];
+        let data = self.data;
+        let max_bs = self.max_blocksize;
 
-        let results: Vec<Result<Vec<u8>, BlockError>> = crate::thread_pool().install(|| {
-            batch
-            .par_iter()
-            .map(|boundary| {
+        let results: Vec<Result<Vec<u8>, BlockError>> =
+            crate::par::par_map(batch.len(), |bi| {
+                let boundary = &batch[bi];
                 let bit_after_magic = boundary.bit_offset + 48;
-                let mut reader = BitReader::from_bit_offset(self.data, bit_after_magic as usize);
-                block::decode_block(&mut reader, self.max_blocksize)
-            })
-            .collect()
-        });
+                let mut reader = BitReader::from_bit_offset(data, bit_after_magic as usize);
+                block::decode_block(&mut reader, max_bs)
+            });
 
         let mut total = 0usize;
         for r in &results {

@@ -1,10 +1,8 @@
 //! Parallel bzip2 decompression — decode N blocks concurrently.
 //!
 //! Uses `block_scan::find_all_blocks()` to locate every block boundary,
-//! then decodes all blocks in parallel via rayon.  Results are concatenated
+//! then decodes all blocks in parallel (scoped threads). Results are concatenated
 //! in order.
-
-use rayon::prelude::*;
 
 use crate::bitreader::BitReader;
 use crate::block::{self, BlockError};
@@ -15,7 +13,7 @@ use crate::FINAL_MAGIC;
 /// Decompress a complete bzip2 stream using parallel block decode.
 ///
 /// `data` must be a complete bzip2 stream (header + blocks + EOS).
-/// Blocks are decoded concurrently on the rayon thread pool.
+/// Blocks are decoded concurrently on scoped worker threads.
 pub fn decompress_parallel(data: &[u8]) -> Result<Vec<u8>, BlockError> {
     // ── Parse stream header ─────────────────────────────────────────────
     if data.len() < 4 {
@@ -43,16 +41,12 @@ pub fn decompress_parallel(data: &[u8]) -> Result<Vec<u8>, BlockError> {
     }
 
     // ── Parallel decode ─────────────────────────────────────────────────
-    let results: Vec<Result<Vec<u8>, BlockError>> = crate::thread_pool().install(|| {
-        boundaries
-        .par_iter()
-        .map(|boundary| {
+    let results: Vec<Result<Vec<u8>, BlockError>> = crate::par::par_map(boundaries.len(), |bi| {
+            let boundary = &boundaries[bi];
             // Position reader right after the 48-bit block magic
             let bit_after_magic = boundary.bit_offset + 48;
             let mut reader = BitReader::from_bit_offset(data, bit_after_magic as usize);
             block::decode_block(&mut reader, max_blocksize)
-        })
-        .collect()
     });
 
     // ── Assemble output in order ────────────────────────────────────────

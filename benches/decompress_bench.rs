@@ -80,7 +80,7 @@ fn bench_decompress() {
         c_best.as_secs_f64() / best.as_secs_f64());
 
     // ── Benchmark: our parallel ─────────────────────────────────────────
-    // Warmup rayon pool
+    // Warmup scoped-thread workers
     let _ = decompress_parallel(compressed);
     let mut times = Vec::new();
     for _ in 0..iterations {

@@ -32,8 +32,14 @@ pub fn decompress_parallel(data: &[u8]) -> Result<Vec<u8>, BlockError> {
     let max_blocksize = 100_000 * (level - b'0') as u32;
 
     // ── Scan for all block boundaries ───────────────────────────────────
-    // Start scanning after the 4-byte header (bit 32).
-    let boundaries = block_scan::find_all_blocks(data);
+    // Parallel bit-scan for BZh block magics. The serial `find_all_blocks`
+    // walks the whole stream on one thread (a serial prefix that dominates on
+    // large inputs); the parallel scan splits the buffer across cores and
+    // merges, producing the identical boundary set.
+    let n_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let boundaries = block_scan::find_all_blocks_parallel(data, n_threads);
 
     if boundaries.is_empty() {
         // Might be an empty file or just EOS marker

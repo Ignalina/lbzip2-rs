@@ -1,6 +1,6 @@
 [package]
 name = "lbzip2"
-version = "0.5.0"  # "Sleipner" — rayon-free (scoped-thread par_map)
+version = "0.5.1"  # "Sleipner" — rayon-free; parallel block-boundary scan in decompress_parallel
 edition = "2024"
 description = "Pure Rust parallel bzip2 decompressor — fast block scanning, multi-core Burrows-Wheeler decode"
 license = "MIT OR Apache-2.0 AND bzip2-1.0.6"
